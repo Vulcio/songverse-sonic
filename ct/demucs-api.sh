@@ -11,8 +11,8 @@ var_os="${var_os:-debian}"
 var_version="${var_version:-13}"
 var_unprivileged="${var_unprivileged:-1}"
 
-# Change this after uploading the project to GitHub, e.g. myuser/demucs-proxmox
-DEFAULT_REPO="bricedupuy/demucs-proxmox"
+# Change this after uploading the project to GitHub, e.g. myuser/songverse-sonic
+DEFAULT_REPO="bricedupuy/songverse-sonic"
 REPO="${DEMUX_API_REPO:-$DEFAULT_REPO}"
 BRANCH="${DEMUX_API_BRANCH:-main}"
 BASE_URL="https://raw.githubusercontent.com/${REPO}/${BRANCH}"

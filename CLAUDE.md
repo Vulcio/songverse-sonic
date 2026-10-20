@@ -1,7 +1,7 @@
-# demucs-proxmox - notes for Claude
+# Songverse Sonic - notes for Claude
 
 The stem-separation server that [Songverse](https://github.com/bricedupuy/Songverse) calls: a FastAPI
-service running Demucs in a Debian LXC on Proxmox, with an optional music analysis of each recording
+service running Demucs, deployed as a Docker image or in a Debian LXC on Proxmox, with an optional music analysis of each recording
 (tempo, beats and downbeats, meter, key, sections). Songverse is its main client; it is a separate
 project with its own users, so its API stays general rather than shaped around Songverse.
 
@@ -12,18 +12,27 @@ project with its own users, so its API stays general rather than shaped around S
 - `tests/`: the pytest suite. `synth.py` makes test audio, so no recordings live in the repository.
 - `ct/` and `install/`: the Proxmox host script and the in-LXC installer and updater, in the
   Community Scripts style. `json/demucs-api.json` is their metadata.
+- `Dockerfile`, `docker/entrypoint.sh`, `docker-compose.yml`, `.env.example`: the Docker images (CPU,
+  and CUDA with `--build-arg TORCH=cu130`), published to `ghcr.io/bricedupuy/songverse-sonic` by
+  `.github/workflows/ci.yml` from `main` and tags.
 - `API.md`: the API's documentation, the contract its clients rely on.
+
+Both ways to deploy run the same `app/` with the same `DEMUX_*` settings: a new setting works in both
+(the LXC's env file, the image's environment and `.env.example`), and a new system package goes in
+both the installer and the `Dockerfile`.
 
 ## Before every push
 
 ```sh
 pip install pytest librosa soundfile fastapi httpx boto3 python-multipart
 python -m pytest tests
-bash -n ct/demucs-api.sh install/demucs-api-install.sh
+bash -n ct/demucs-api.sh install/demucs-api-install.sh docker/entrypoint.sh
+docker build -t songverse-sonic:test .   # when the Dockerfile, docker/ or requirements change
 ```
 
 All tests must pass. The install scripts can't run outside Proxmox: check their syntax, change them
-carefully, and say in the commit what you couldn't run.
+carefully, and say in the commit what you couldn't run. CI runs the tests, builds both images and
+checks the CPU one starts and answers `/api/v1/health`: watch it after pushing.
 
 ## The API is a contract
 

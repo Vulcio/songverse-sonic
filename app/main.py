@@ -11,6 +11,7 @@ import shutil
 import socket
 import sqlite3
 import subprocess
+import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -31,7 +32,32 @@ import analysis
 DATA_DIR = Path(os.getenv("DEMUX_DATA_DIR", "/var/lib/demucs-api"))
 JOBS_DIR = DATA_DIR / "jobs"
 DB_PATH = DATA_DIR / "jobs.db"
-API_KEY = os.environ["DEMUX_API_KEY"]
+APP_DIR = Path(__file__).resolve().parent
+# The API's version, as app/VERSION says (reported by /api/v1/health since 1.6).
+VERSION = (APP_DIR / "VERSION").read_text().strip() if (APP_DIR / "VERSION").is_file() else "unknown"
+
+
+def _api_key() -> str:
+    """DEMUX_API_KEY, or the file DEMUX_API_KEY_FILE names (a Docker secret)."""
+    key = os.getenv("DEMUX_API_KEY", "").strip()
+    if not key and os.getenv("DEMUX_API_KEY_FILE"):
+        key = Path(os.environ["DEMUX_API_KEY_FILE"]).read_text().strip()
+    if not key:
+        raise RuntimeError("Set DEMUX_API_KEY (or DEMUX_API_KEY_FILE)")
+    return key
+
+
+def _demucs_bin() -> str:
+    """DEMUX_DEMUCS_BIN, else the demucs beside this Python (the LXC's venv, the image's), else on PATH."""
+    configured = os.getenv("DEMUX_DEMUCS_BIN")
+    if configured:
+        return configured
+    beside = Path(sys.executable).parent / "demucs"
+    return str(beside) if beside.exists() else (shutil.which("demucs") or "demucs")
+
+
+API_KEY = _api_key()
+DEMUCS_BIN = _demucs_bin()
 DEFAULT_MODEL = os.getenv("DEMUX_DEFAULT_MODEL", "htdemucs")
 DEFAULT_DEVICE = os.getenv("DEMUX_DEVICE", "cpu").lower()
 ALLOWED_DEVICES = {
@@ -402,7 +428,7 @@ def run_demucs(job_id: str, quality: Literal["fast", "hq"]) -> None:
     model = row[f"{quality}_model"]
     device = row[f"{quality}_device"]
     cmd = [
-        "/opt/demucs-api/.venv/bin/demucs",
+        DEMUCS_BIN,
         "-d", device,
         "-n", model,
         "-o", str(temp_out),
@@ -643,7 +669,7 @@ async def lifespan(_: FastAPI):
         task.cancel()
 
 
-app = FastAPI(title="Demucs API", version="1.5.0", lifespan=lifespan)
+app = FastAPI(title="Songverse Sonic", version="1.6.0", lifespan=lifespan)
 
 
 class StageRequest(BaseModel):
@@ -687,6 +713,8 @@ def health():
         scheduled_hq = conn.execute("SELECT COUNT(*) FROM jobs WHERE hq_status='scheduled'").fetchone()[0]
     return {
         "status": "ok",
+        "service": "songverse-sonic",
+        "version": VERSION,
         "queue_depth": work_queue.qsize(),
         "queued_fast": queued_fast,
         "scheduled_hq": scheduled_hq,

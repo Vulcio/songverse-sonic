@@ -1,0 +1,26 @@
+# Songverse Sonic with Docker Compose. Copy .env.example to .env, set DEMUX_API_KEY, then:
+#   docker compose up -d                 # CPU
+#   docker compose --profile gpu up -d   # NVIDIA GPU (needs the NVIDIA container toolkit)
+services:
+  sonic:
+    image: ghcr.io/bricedupuy/songverse-sonic:latest
+    profiles: ["", "cpu"]
+    env_file: .env
+    ports: ["8000:8000"]
+    volumes: ["sonic-data:/var/lib/demucs-api"]
+    restart: unless-stopped
+
+  sonic-gpu:
+    image: ghcr.io/bricedupuy/songverse-sonic:cuda
+    profiles: ["gpu"]
+    env_file: .env
+    ports: ["8000:8000"]
+    volumes: ["sonic-data:/var/lib/demucs-api"]
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices: [{ driver: nvidia, count: 1, capabilities: [gpu] }]
+
+volumes:
+  sonic-data:

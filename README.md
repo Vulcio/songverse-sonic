@@ -1,6 +1,15 @@
-# Demucs API for Proxmox LXC
+# Songverse Sonic
 
-A Community-Scripts-style Proxmox VE installer for a dedicated **Debian 13 LXC** running **Demucs 4.1.0** behind a FastAPI REST API.
+Stem separation (**Demucs 4.1.0**) and music analysis behind a FastAPI REST API: the server
+[Songverse](https://github.com/bricedupuy/Songverse) sends recordings to, and anyone else can call.
+(It was called *demucs-proxmox* until 1.6; its API, settings and the LXC's names are unchanged.)
+
+Two ways to deploy it, the same app either way:
+
+- **[Docker](#deploy-with-docker)**: an image for the CPU and one for NVIDIA GPUs, on any server.
+- **[Proxmox LXC](#install-on-proxmox)**: a Community-Scripts-style installer for a dedicated **Debian 13 LXC**.
+
+A church, a team or an organisation can run its own and connect it in Songverse's settings.
 
 It is designed for an orchestrated workflow such as:
 
@@ -32,14 +41,16 @@ URL -> File -> Demucs fast pass -> R2
 - Music analysis (tempo, first downbeat, meter, key, sections) on every job after the fast pass
 - Automatic job cleanup
 - Reverse-proxy-aware public URLs and trusted forwarding configuration
-- `/usr/bin/update` updater inside the LXC
-- systemd service
+- Docker images (CPU and CUDA) with a health check, or a Proxmox LXC with a systemd service and an `update` command
 
 Full endpoint documentation is in **[API.md](API.md)**.
 
 ## Repository layout
 
 ```text
+Dockerfile                       The Docker image (CPU, or CUDA with TORCH=cu130)
+docker/entrypoint.sh             The image's start-up: device, model download, uvicorn
+docker-compose.yml, .env.example Running the image with Docker Compose
 ct/demucs-api.sh                 Proxmox LXC creator + in-LXC updater
 install/demucs-api-install.sh    First-install script
 app/main.py                      REST API, scheduler, worker and webhooks
@@ -51,12 +62,49 @@ json/demucs-api.json             Community Scripts-style metadata
 API.md                           API and reverse-proxy documentation
 ```
 
-## Install
+## Deploy with Docker
+
+Images are published to GitHub's registry from every push to `main`:
+
+| Image | For |
+| --- | --- |
+| `ghcr.io/bricedupuy/songverse-sonic:latest` | CPU (any x86-64 server) |
+| `ghcr.io/bricedupuy/songverse-sonic:cuda` | NVIDIA GPU, with the [NVIDIA container toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/) |
+
+Each is also tagged with the API's version (`1.6.0`, `1.6.0-cuda`) and the commit (`sha-…`).
+
+```bash
+docker run -d --name sonic -p 8000:8000 \
+  -e DEMUX_API_KEY="$(openssl rand -hex 32)" \
+  -v sonic-data:/var/lib/demucs-api \
+  ghcr.io/bricedupuy/songverse-sonic:latest
+curl http://localhost:8000/api/v1/health
+```
+
+Or with Docker Compose: copy `docker-compose.yml` and `.env.example` (as `.env`), set
+`DEMUX_API_KEY`, then `docker compose up -d` (CPU) or `docker compose --profile gpu up -d` (GPU).
+
+- **Settings** are the same `DEMUX_*` variables as the LXC's (see [Configuration](#configuration)).
+  The key can come from a file instead (`DEMUX_API_KEY_FILE`, for Docker secrets).
+- **Models** download into the volume on first use; `DEMUX_PRELOAD_MODELS=htdemucs htdemucs_ft`
+  fetches them when the container starts instead.
+- **Data** (jobs, their results, the models) lives in the `/var/lib/demucs-api` volume; the
+  container runs as a non-root user (uid 10001).
+- **The GPU image** uses the GPU when PyTorch sees one, else says so in its log and uses the CPU.
+- **HTTPS:** put it behind a reverse proxy (see [Reverse proxy](#reverse-proxy)), with
+  `DEMUX_PUBLIC_BASE_URL`, `DEMUX_TRUST_PROXY_HEADERS=true` and the proxy's address in
+  `DEMUX_FORWARDED_ALLOW_IPS`.
+- **Updating:** `docker pull` the image and recreate the container; the volume keeps the jobs.
+
+To build it yourself: `docker build -t songverse-sonic .`, or `--build-arg TORCH=cu130` for CUDA
+(`BASE=` picks another Python base image, such as a registry mirror).
+
+## Install on Proxmox
 
 Run on the Proxmox VE host as root:
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/bricedupuy/demucs-proxmox/main/ct/demucs-api.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/bricedupuy/songverse-sonic/main/ct/demucs-api.sh)"
 ```
 
 Default installation:
@@ -229,6 +277,9 @@ DEMUX_ALLOW_PRIVATE_SOURCE_URLS=true
 DEMUX_ALLOW_PRIVATE_CALLBACK_URLS=false
 ANALYSIS_ENABLED=true
 ```
+
+Also: `DEMUX_API_KEY_FILE` (the key read from a file, when `DEMUX_API_KEY` is empty) and
+`DEMUX_DEMUCS_BIN` (the `demucs` command; by default the one beside the Python running the API).
 
 Restart after editing:
 

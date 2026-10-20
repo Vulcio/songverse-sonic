@@ -1,6 +1,6 @@
-# Demucs API Documentation
+# Songverse Sonic API
 
-API version: **1.5.0**
+API version: **1.6.0**
 
 The service provides asynchronous Demucs stem separation with an optional two-stage workflow:
 
@@ -90,6 +90,8 @@ Example response:
 ```json
 {
   "status": "ok",
+  "service": "songverse-sonic",
+  "version": "1.6.0",
   "queue_depth": 0,
   "queued_fast": 0,
   "scheduled_hq": 3,
@@ -105,6 +107,9 @@ Example response:
   "analysis": { "enabled": true, "backend": "librosa" }
 }
 ```
+
+`service` and `version` (since 1.6) say what is answering and which API version it speaks, so a client
+can check a server before using it (Songverse's **Test connection**). An older server leaves them out.
 
 ## Models and devices
 

@@ -1,5 +1,5 @@
 {
-  "name": "Demucs API",
+  "name": "Songverse Sonic",
   "slug": "demucs-api",
   "categories": [
     9
@@ -9,9 +9,9 @@
   "updateable": true,
   "privileged": false,
   "interface_port": 8000,
-  "documentation": "https://github.com/bricedupuy/demucs-proxmox#readme",
+  "documentation": "https://github.com/bricedupuy/songverse-sonic#readme",
   "website": "https://pypi.org/project/demucs/",
-  "repository": "https://github.com/bricedupuy/demucs-proxmox",
+  "repository": "https://github.com/bricedupuy/songverse-sonic",
   "architectures": [
     "amd64"
   ],

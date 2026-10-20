@@ -1,0 +1,99 @@
+# Tests, the install scripts' syntax, and the Docker images: built on every push and pull request,
+# published to GHCR from main and from version tags (ghcr.io/<owner>/songverse-sonic).
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsndfile1
+      - run: pip install pytest librosa soundfile fastapi httpx boto3 python-multipart
+      - run: python -m pytest tests
+      - run: bash -n ct/demucs-api.sh install/demucs-api-install.sh docker/entrypoint.sh
+
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - torch: cpu
+            suffix: ""
+          - torch: cu130
+            suffix: "-cuda"
+    env:
+      PUBLISH: ${{ github.event_name == 'push' }}
+    steps:
+      - uses: actions/checkout@v4
+      # PyTorch's CUDA wheels are several gigabytes: make room on the runner.
+      - if: matrix.torch != 'cpu'
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
+      - id: meta
+        run: |
+          echo "version=$(tr -d '[:space:]' < app/VERSION)" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/songverse-sonic" >> "$GITHUB_OUTPUT"
+      - uses: docker/metadata-action@v5
+        id: tags
+        with:
+          images: ${{ steps.meta.outputs.image }}
+          flavor: |
+            latest=false
+            suffix=${{ matrix.suffix }}
+          # "latest" and "cuda" from main; the API version and the commit everywhere it's published.
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' && matrix.torch == 'cpu' }},suffix=
+            type=raw,value=cuda,enable=${{ github.ref == 'refs/heads/main' && matrix.torch != 'cpu' }},suffix=
+            type=raw,value=${{ steps.meta.outputs.version }}
+            type=sha
+      - uses: docker/setup-buildx-action@v3
+      - if: env.PUBLISH == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # The CPU image first, loaded and checked: it starts and answers its health check.
+      - if: matrix.torch == 'cpu'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          build-args: TORCH=cpu
+          load: true
+          tags: songverse-sonic:test
+          cache-from: type=gha,scope=cpu
+          cache-to: type=gha,mode=max,scope=cpu
+      - if: matrix.torch == 'cpu'
+        run: |
+          docker run -d --name sonic -p 8000:8000 -e DEMUX_API_KEY=ci songverse-sonic:test
+          for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8000/api/v1/health > health.json && break; sleep 2; done
+          cat health.json
+          python3 -c 'import json; d = json.load(open("health.json")); assert d["service"] == "songverse-sonic" and d["version"] == open("app/VERSION").read().strip(), d'
+          docker exec sonic sh -c 'command -v ffmpeg && python -c "import torch, demucs, librosa; print(torch.__version__)"'
+      # Published from main and tags; the CUDA image is built on every run, so a pull request checks it too.
+      - if: env.PUBLISH == 'true' || matrix.torch != 'cpu'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          build-args: TORCH=${{ matrix.torch }}
+          push: ${{ env.PUBLISH == 'true' }}
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: ${{ steps.tags.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.torch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.torch }}
