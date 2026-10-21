@@ -1,6 +1,6 @@
 # Songverse Sonic - notes for Claude
 
-The stem-separation server that [Songverse](https://github.com/bricedupuy/Songverse) calls: a FastAPI
+The stem-separation server that [Songverse](https://github.com/Vulcio/Oneverse) calls: a FastAPI
 service running Demucs, deployed as a Docker image or in a Debian LXC on Proxmox, with an optional music analysis of each recording
 (tempo, beats and downbeats, meter, key, sections). Songverse is its main client; it is a separate
 project with its own users, so its API stays general rather than shaped around Songverse.

@@ -1,7 +1,7 @@
 # Songverse Sonic
 
 Stem separation (**Demucs 4.1.0**) and music analysis behind a FastAPI REST API: the server
-[Songverse](https://github.com/bricedupuy/Songverse) sends recordings to, and anyone else can call.
+[Songverse](https://github.com/Vulcio/Oneverse) sends recordings to, and anyone else can call.
 (It was called *demucs-proxmox* until 1.6; its API, settings and the LXC's names are unchanged.)
 
 Two ways to deploy it, the same app either way:
