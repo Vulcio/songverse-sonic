@@ -55,6 +55,7 @@ ct/demucs-api.sh                 Proxmox LXC creator + in-LXC updater
 install/demucs-api-install.sh    First-install script
 app/main.py                      REST API, scheduler, worker and webhooks
 app/analysis.py                  Music analysis (tempo, key, sections)
+app/rhythm.py                    Standalone librosa rhythm calculations (existing baseline)
 tests/                           pytest suite
 app/requirements.txt             Python dependencies
 app/VERSION                      API version

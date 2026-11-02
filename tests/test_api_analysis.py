@@ -47,3 +47,63 @@ def test_analysis_failure_does_not_fail_job(main, monkeypatch):
 
 def test_health_reports_analysis(main):
     assert main.health()["analysis"]["enabled"] is True
+
+
+@pytest.mark.parametrize("outcome", ["found", "empty", "failed"])
+def test_fast_completion_waits_for_analysis(main, monkeypatch, outcome):
+    jid = _job(main)
+    expected = {"tempo": {"bpm": 100.0}} if outcome == "found" else None
+    calls = []
+    during_analysis = []
+
+    def separate(job_id, quality):
+        (main.result_dir(job_id, quality) / "drums.wav").write_bytes(b"separated audio")
+
+    def analyze(*args, **kwargs):
+        calls.append("analysis")
+        during_analysis.append(main.public_job(main.get_job(jid)))
+        if outcome == "failed":
+            raise RuntimeError("unavailable analyzer")
+        return expected
+
+    def notify(job_id, event):
+        calls.append(event)
+        payload = main.webhook_payload(job_id, event)
+        assert payload["job"]["fast"]["status"] == "completed"
+        assert payload["job"]["analysis"] == expected
+
+    monkeypatch.setattr(main, "run_demucs", separate)
+    monkeypatch.setattr(main, "upload_r2", lambda *args: None)
+    monkeypatch.setattr(main.analysis, "analyze_job", analyze)
+    monkeypatch.setattr(main, "enqueue_notification", notify)
+    main.process_stage(jid, "fast")
+
+    assert calls == ["analysis", "fast.completed"]
+    assert during_analysis[0]["fast"]["status"] == "processing"
+    assert during_analysis[0]["analysis"] is None
+    job = main.public_job(main.get_job(jid))
+    assert job["status"] == "completed"
+    assert job["error"] is None
+    assert job["analysis"] == expected
+    assert [f["name"] for f in job["fast"]["files"]] == ["drums.wav"]
+    assert (main.result_dir(jid, "fast") / "drums.wav").read_bytes() == b"separated audio"
+
+
+def test_hq_preserves_fast_analysis(main, monkeypatch):
+    jid = _job(main)
+    expected = {"tempo": {"bpm": 100.0}}
+    with main.db() as conn:
+        conn.execute(
+            "UPDATE jobs SET analysis_json=?, fast_status='completed', hq_enabled=1, "
+            "hq_status='scheduled' WHERE id=?", (json.dumps(expected), jid),
+        )
+    events = []
+    monkeypatch.setattr(main, "run_demucs", lambda *args: None)
+    monkeypatch.setattr(main, "upload_r2", lambda *args: None)
+    monkeypatch.setattr(main, "run_analysis", lambda *args: pytest.fail("HQ must not rerun analysis"))
+    monkeypatch.setattr(main, "enqueue_notification", lambda jid, event: events.append(main.webhook_payload(jid, event)))
+    main.process_stage(jid, "hq")
+
+    assert [event["event"] for event in events] == ["hq.started", "hq.completed"]
+    assert all(event["job"]["analysis"] == expected for event in events)
+    assert main.public_job(main.get_job(jid))["analysis"] == expected
