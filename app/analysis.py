@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from analyzers import AnalysisBudget, AnalysisInput, LegacyAnalysisAdapter
 from rhythm import analyze_rhythm
 
 log = logging.getLogger("demucs-api.analysis")
@@ -310,7 +311,7 @@ def _sections(y_mix, y_vocals, sr: int, first_downbeat: float | None, bar_len: f
     return out
 
 
-def _analyze_librosa(files: list[Path], source: Path | None, budget: _Budget) -> dict:
+def _analyze_librosa(files: list[Path], source: Path | None, budget: AnalysisBudget) -> dict:
     sr = 22050
     drums, bass = _find_stem(files, "drums"), _find_stem(files, "bass")
     other, vocals = _find_stem(files, "other"), _find_stem(files, "vocals")
@@ -377,7 +378,7 @@ _AIO_LABELS = {"start": None, "end": None, "intro": "intro", "verse": "verse", "
                "bridge": "bridge", "inst": "inst", "solo": "solo", "break": "break", "outro": "outro"}
 
 
-def _analyze_allin1(files: list[Path], source: Path | None, work_dir: Path, device: str, budget: _Budget) -> dict:
+def _analyze_allin1(files: list[Path], source: Path | None, work_dir: Path, device: str, budget: AnalysisBudget) -> dict:
     import shutil
 
     import allin1  # type: ignore  # optional dependency
@@ -431,32 +432,35 @@ def _analyze_allin1(files: list[Path], source: Path | None, work_dir: Path, devi
 # Entry point
 # --------------------------------------------------------------------------- #
 
+class LibrosaAnalyzer:
+    """Adapt the existing stem-aware backend to the internal interface."""
+
+    engine_id = "librosa"
+
+    def analyze(self, inputs: AnalysisInput, budget: AnalysisBudget) -> dict[str, Any]:
+        return _analyze_librosa(list(inputs.files), inputs.source, budget)
+
+
+class AllInOneAnalyzer:
+    """Optional backend; importing this adapter does not import allin1."""
+
+    engine_id = "allin1"
+
+    def analyze(self, inputs: AnalysisInput, budget: AnalysisBudget) -> dict[str, Any]:
+        return _analyze_allin1(list(inputs.files), inputs.source, inputs.work_dir, inputs.device, budget)
+
+
 def analyze_job(files: list[Path], source: Path | None, work_dir: Path, device: str = "cpu") -> dict | None:
-    """Analyse a job after its fast pass. Never raises; returns a sanitised dict or None."""
+    """Legacy entry point: same settings, best-effort behavior and sanitized result."""
     if not ANALYSIS_ENABLED:
         return None
     budget = _Budget(ANALYSIS_TIMEOUT)
     started = time.monotonic()
-    raw: dict[str, Any] = {}
-    duration = None
-    try:
-        if ANALYSIS_BACKEND == "allin1":
-            try:
-                raw = _analyze_allin1(files, source, work_dir, device, budget)
-            except Exception:
-                log.exception("analysis: allin1 backend failed; falling back to librosa")
-        fallback = _analyze_librosa(files, source, budget)
-        duration = fallback.pop("_duration", None)
-        # Keep All-In-One's values where it had them; fill the rest from librosa. Beats and the
-        # fields derived from them travel together, so never mix the two trackers' versions.
-        beat_keys = {"tempo", "first_beat", "beats", "downbeats", "beats_confidence", "intro_free"}
-        if "beats" in raw:
-            fallback = {k: v for k, v in fallback.items() if k not in beat_keys}
-        for k, v in fallback.items():
-            if k not in raw:
-                raw[k] = v
-    except Exception:
-        log.exception("analysis failed")
-    result = sanitize_analysis(raw, duration)
+    inputs = AnalysisInput(tuple(files), source, work_dir, device)
+    adapter = LegacyAnalysisAdapter(
+        LibrosaAnalyzer(), sanitize_analysis,
+        AllInOneAnalyzer() if ANALYSIS_BACKEND == "allin1" else None,
+    )
+    result = adapter.analyze(inputs, budget)
     log.info("analysis done in %.1fs: fields=%s", time.monotonic() - started, sorted(result or {}))
     return result

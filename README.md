@@ -45,6 +45,8 @@ URL -> File -> Demucs fast pass -> R2
 
 Full endpoint documentation is in **[API.md](API.md)**.
 
+Internal development: [analyzer interface and legacy adapter](docs/architecture/analyzer-interface.md).
+
 ## Repository layout
 
 ```text
@@ -55,6 +57,7 @@ ct/demucs-api.sh                 Proxmox LXC creator + in-LXC updater
 install/demucs-api-install.sh    First-install script
 app/main.py                      REST API, scheduler, worker and webhooks
 app/analysis.py                  Music analysis (tempo, key, sections)
+app/analyzers.py                 Internal analyzer interface and legacy combination policy
 app/rhythm.py                    Standalone librosa rhythm calculations (existing baseline)
 tests/                           pytest suite
 app/requirements.txt             Python dependencies
