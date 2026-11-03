@@ -26,7 +26,9 @@ both the installer and the `Dockerfile`.
 ```sh
 pip install pytest librosa soundfile fastapi httpx boto3 python-multipart
 python -m pytest tests
-bash -n ct/demucs-api.sh install/demucs-api-install.sh docker/entrypoint.sh
+for script in ct/*.sh install/*.sh docker/*.sh; do
+  bash -n "$script" || exit
+done
 docker build -t songverse-sonic:test .   # when the Dockerfile, docker/ or requirements change
 ```
 
