@@ -22,7 +22,10 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsndfile1
       - run: pip install pytest librosa soundfile fastapi httpx boto3 python-multipart
       - run: python -m pytest tests
-      - run: bash -n ct/demucs-api.sh install/demucs-api-install.sh docker/entrypoint.sh
+      - run: |
+          for script in ct/*.sh install/*.sh docker/*.sh; do
+            bash -n "$script" || exit
+          done
 
   image:
     needs: test
