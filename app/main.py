@@ -760,7 +760,7 @@ async def lifespan(_: FastAPI):
         task.cancel()
 
 
-app = FastAPI(title="Songverse Sonic", version="1.6.1", lifespan=lifespan)
+app = FastAPI(title="Songverse Sonic", version="1.7.0", lifespan=lifespan)
 
 
 class StageRequest(BaseModel):
@@ -794,6 +794,8 @@ def analysis_info() -> dict:
     return {
         "enabled": analysis.ANALYSIS_ENABLED,
         "backend": analysis.ANALYSIS_BACKEND if analysis.ANALYSIS_ENABLED else None,
+        # Since 1.7: the chord engine, or null when chords are off (issue #15).
+        "chords": analysis.ANALYSIS_CHORDS if analysis.ANALYSIS_ENABLED and analysis.ANALYSIS_CHORDS != "off" else None,
     }
 
 

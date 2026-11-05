@@ -9,6 +9,8 @@ project with its own users, so its API stays general rather than shaped around S
 
 - `app/main.py`: the REST API, the job queue and scheduler, the worker, webhooks, R2/S3 upload.
 - `app/analysis.py`: the music analysis (librosa by default; `allin1` optional and off).
+- `app/chords.py`: chords (BTC, optional and off), chords on beats, bar lines from chord changes.
+- `benchmarks/`: beats, bars and chords measured on annotated songs kept outside Git (issue #9).
 - `tests/`: the pytest suite. `synth.py` makes test audio, so no recordings live in the repository.
 - `ct/` and `install/`: the Proxmox host script and the in-LXC installer and updater, in the
   Community Scripts style. `json/demucs-api.json` is their metadata.
@@ -24,7 +26,8 @@ both the installer and the `Dockerfile`.
 ## Before every push
 
 ```sh
-pip install pytest librosa soundfile fastapi httpx boto3 python-multipart
+pip install pytest librosa soundfile fastapi httpx boto3 python-multipart mir_eval
+pip install --index-url https://download.pytorch.org/whl/cpu torch   # the chord tests skip without it
 python -m pytest tests
 bash -n ct/demucs-api.sh install/demucs-api-install.sh docker/entrypoint.sh
 docker build -t songverse-sonic:test .   # when the Dockerfile, docker/ or requirements change

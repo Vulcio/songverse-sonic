@@ -38,7 +38,7 @@ URL -> File -> Demucs fast pass -> R2
 - Direct file upload
 - Remote HTTP/HTTPS audio input
 - Optional direct Cloudflare R2/S3 upload
-- Music analysis (tempo, first downbeat, meter, key, sections) on every job after the fast pass
+- Music analysis (tempo, beats and bars, meter, key, sections, and optionally chords) on every job after the fast pass
 - Automatic job cleanup
 - Reverse-proxy-aware public URLs and trusted forwarding configuration
 - Docker images (CPU and CUDA) with a health check, or a Proxmox LXC with a systemd service and an `update` command
@@ -55,6 +55,8 @@ ct/demucs-api.sh                 Proxmox LXC creator + in-LXC updater
 install/demucs-api-install.sh    First-install script
 app/main.py                      REST API, scheduler, worker and webhooks
 app/analysis.py                  Music analysis (tempo, key, sections)
+app/chords.py                    Chord recognition (BTC), chords on beats, bars from chord changes
+benchmarks/run.py                Benchmarks for beats, bars and chords on annotated songs
 app/rhythm.py                    Standalone librosa rhythm calculations (existing baseline)
 tests/                           pytest suite
 app/requirements.txt             Python dependencies
@@ -72,7 +74,7 @@ Images are published to GitHub's registry from every push to `main`:
 | `ghcr.io/bricedupuy/songverse-sonic:latest` | CPU (any x86-64 server) |
 | `ghcr.io/bricedupuy/songverse-sonic:cuda` | NVIDIA GPU, with the [NVIDIA container toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/) |
 
-Each is also tagged with the API's version (`1.6.1`, `1.6.1-cuda`) and the commit (`sha-…`).
+Each is also tagged with the API's version (`1.7.0`, `1.7.0-cuda`) and the commit (`sha-…`).
 
 ```bash
 docker run -d --name sonic -p 8000:8000 \
@@ -184,7 +186,16 @@ Settings in `/etc/demucs-api/demucs-api.env`:
 ANALYSIS_ENABLED=true            # false turns it off
 ANALYSIS_BACKEND=librosa         # or allin1 (opt-in, see below)
 ANALYSIS_TIMEOUT_SECONDS=60      # budget; remaining steps are skipped once exceeded
+ANALYSIS_CHORDS=off              # btc to find chords (or btc-chordmini, see the licences below)
+ANALYSIS_CHORDS_INPUT=mix        # mix, or harmonic (the stems without drums and vocals)
 ```
+
+**Chords** (`ANALYSIS_CHORDS=btc`, off by default) add `chords` and `beat_chords` to the analysis and
+let chord changes correct the bar lines (see API.md). The model is BTC (about 12 MB): it is downloaded
+the first time chords are asked for, from a fixed commit, and checked against its sha256, into
+`$DEMUX_DATA_DIR/models` (`ANALYSIS_MODELS_DIR` to put it elsewhere). It runs on the CPU in a few
+seconds per song, with the PyTorch that Demucs already needs. If the download fails, the analysis is
+done without chords and the next job tries again.
 
 ### Libraries and licences
 
@@ -198,6 +209,10 @@ This server may be used commercially and its client Songverse is AGPL-3.0, so on
 | madmom | code BSD-3, **model files CC BY-NC-SA** | **Not used** (non-commercial models). |
 | Essentia | AGPL-3.0 | **Not used.** |
 | All-In-One (`allin1`) | code MIT; **weights' licence is not stated** in the repository; trained on the Harmonix Set; depends on madmom and NATTEN | **Opt-in only**, off by default. |
+| BTC chord model ([BTC-ISMIR19](https://github.com/jayg996/BTC-ISMIR19), Park et al. 2019) | code and published weights MIT | **Opt-in** (`ANALYSIS_CHORDS=btc`): inference code reproduced in `app/chords.py`. |
+| ChordMini's BTC ([ChordMini](https://github.com/ptnghia-j/ChordMini), Phan et al. 2026) | code MIT; the weights are in the MIT repository, but were trained partly on labelled data its authors keep private for copyright reasons | **Opt-in** (`ANALYSIS_CHORDS=btc-chordmini`), for benchmarks; check its terms before using it in production. |
+| mir_eval | MIT | Benchmarks only (`benchmarks/`). |
+| SongFormer, Beat This!, Beat-Transformer | see issue #10 | **Not used** yet; candidates for the benchmarks. |
 
 How the default works: tempo from a harmonic comb over the autocorrelation of the drum accents (kick and snare-body flux, so hi-hats do not look like double time), with a log-normal prior toward ~92 bpm to choose the octave (double/half time is not decidable from periodicity alone: songs counted faster than ~140 are folded to half, and the confidence drops near the boundaries); beats tracked on drums plus the mix's low band so a drumless intro still has a grid; the meter (3 or 4 beats per bar) and downbeat phase from kick accents plus chord changes (chroma novelty) with a prior toward 4/4, and `first_beat` as the start of bar 1, extended back over the intro to where the music starts;
 `beats`/`downbeats` are the tracked beats themselves (sub-frame refined, trailing ring-out dropped), and `tempo.bpm` is their median interval so the fields always agree; `intro_free` compares how periodic the onset envelope is before vs after the first sustained downbeat, and is only answered for intros of 8+ beats (otherwise left out); key from the bass+other stems (or `no_vocals`); sections from clustering chroma/MFCC features of the mix, snapped to bars, with labels guessed from repetition, loudness and whether the vocal stem is active. These are heuristics, not trained models: sections in particular are rough.

@@ -39,6 +39,7 @@ chown -R demucs-api:demucs-api "$DATA_DIR" "$CACHE_DIR"
 msg "Downloading application files"
 curl -fsSL "$BASE_URL/app/main.py" -o "$APP_DIR/main.py"
 curl -fsSL "$BASE_URL/app/analysis.py" -o "$APP_DIR/analysis.py"
+curl -fsSL "$BASE_URL/app/chords.py" -o "$APP_DIR/chords.py"
 curl -fsSL "$BASE_URL/app/rhythm.py" -o "$APP_DIR/rhythm.py"
 curl -fsSL "$BASE_URL/app/requirements.txt" -o "$APP_DIR/requirements.txt"
 curl -fsSL "$BASE_URL/app/VERSION" -o "$APP_DIR/VERSION"
@@ -129,6 +130,8 @@ DEMUX_HQ_END_HOUR=${HQ_END_HOUR}
 ANALYSIS_ENABLED=true
 ANALYSIS_BACKEND=librosa
 ANALYSIS_TIMEOUT_SECONDS=60
+ANALYSIS_CHORDS=off
+ANALYSIS_CHORDS_INPUT=mix
 DEMUX_PUBLIC_BASE_URL=
 DEMUX_TRUST_PROXY_HEADERS=false
 DEMUX_FORWARDED_ALLOW_IPS=127.0.0.1

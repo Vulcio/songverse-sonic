@@ -59,3 +59,47 @@ def make_song(dirpath, bpm=72.0, intro_bars=4, bars=16, lead=0.0, subdivide=2, m
     for name, y in (("drums", drums), ("bass", bass), ("other", other), ("vocals", np.zeros(n))):
         sf.write(f"{dirpath}/{name}.wav", (y * 0.9).astype("float32"), SR)
     return lead_total + intro_bars * bar, bar
+
+
+QUALITY_INTERVALS = {"maj": (0, 4, 7), "min": (0, 3, 7), "7": (0, 4, 7, 10), "maj7": (0, 4, 7, 11),
+                     "min7": (0, 3, 7, 10), "sus4": (0, 5, 7), "sus2": (0, 2, 7), "dim": (0, 3, 6)}
+
+
+def make_progression(dirpath, progression, bpm=90.0, bars=16, meter=4, kick_on=0, seed=1):
+    """One chord per bar from `progression` [(root pitch class, quality)], repeated: a sawtooth-ish
+    pad (triad with its 2nd and 3rd harmonics, voiced around middle C) in other.wav, the root an
+    octave below in bass.wav, and drums with a kick only on beat `kick_on` (0 = the downbeat) and a
+    hi-hat on every beat. The first bar starts at 0.5 s. Returns (first_downbeat, bar, beat)."""
+    rng = np.random.default_rng(seed)
+    beat = 60.0 / bpm
+    bar = beat * meter
+    first = 0.5
+    n = int((first + bars * bar + 1.0) * SR)
+    drums, bass, other = np.zeros(n), np.zeros(n), np.zeros(n)
+    k = np.arange(int(0.15 * SR)) / SR
+    kick = np.sin(2 * np.pi * 55 * k) * np.exp(-k * 28)
+    noise = rng.standard_normal(len(k) + 2)
+    hat = np.diff(noise, 2) * np.exp(-k * 90) * 0.15
+
+    def tone(freq, seg):
+        return sum(np.sin(2 * np.pi * freq * h * seg) / h for h in (1, 2, 3))
+
+    for b in range(bars):
+        t0 = first + b * bar
+        i0, i1 = int(t0 * SR), min(n, int((t0 + bar) * SR))
+        seg = np.arange(i1 - i0) / SR
+        env = np.minimum(1, seg / 0.05) * np.exp(-seg * 0.4)
+        root, quality = progression[b % len(progression)]
+        base = 261.63 * 2 ** (root / 12)
+        if root >= 7:
+            base /= 2  # keep voicings around middle C
+        other[i0:i1] += sum(tone(base * 2 ** (iv / 12), seg) for iv in QUALITY_INTERVALS[quality]) * 0.06 * env
+        bass[i0:i1] += tone(base / 2, seg) * 0.15 * env
+        for j in range(meter):
+            s = int((t0 + j * beat) * SR)
+            if j == kick_on:
+                drums[s:s + len(kick)] += kick[: max(0, min(len(kick), n - s))]
+            drums[s:s + len(hat)] += hat[: max(0, min(len(hat), n - s))]
+    for name, y in (("drums", drums), ("bass", bass), ("other", other), ("vocals", np.zeros(n))):
+        sf.write(f"{dirpath}/{name}.wav", (y * 0.9).astype("float32"), SR)
+    return first, bar, beat

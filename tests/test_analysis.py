@@ -16,7 +16,8 @@ def check_contract(a, duration=None):
     if not a:
         return
     assert set(a) <= {"tempo", "first_beat", "time_signature", "key", "sections",
-                      "beats", "downbeats", "intro_free", "beats_confidence"}
+                      "beats", "downbeats", "intro_free", "beats_confidence",
+                      "chords", "beat_chords", "engines"}
     for k in ("tempo", "time_signature", "key"):
         if k in a and "confidence" in a[k]:
             assert 0 <= a[k]["confidence"] <= 1
@@ -51,6 +52,16 @@ def check_contract(a, duration=None):
         assert 0 <= a["beats_confidence"] <= 1
     if "intro_free" in a:
         assert isinstance(a["intro_free"], bool)
+    if "chords" in a:
+        chords = a["chords"]
+        assert chords and all(c["end"] > c["start"] for c in chords)
+        assert all(b["start"] >= c["end"] for c, b in zip(chords, chords[1:]))
+        for c in chords:
+            assert c["label"] == "N" or (0 <= c["root"] <= 11 and c["quality"] in analysis.CHORD_QUALITIES)
+    if "beat_chords" in a:
+        assert "beats" in a and "chords" in a and len(a["beat_chords"]) == len(a["beats"])
+    if "engines" in a:
+        assert set(a["engines"]) <= analysis.ENGINE_PARTS
     json.dumps(a)
 
 

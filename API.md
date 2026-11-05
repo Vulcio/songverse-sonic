@@ -1,6 +1,6 @@
 # Songverse Sonic API
 
-API version: **1.6.1**
+API version: **1.7.0**
 
 The service provides asynchronous Demucs stem separation with an optional two-stage workflow:
 
@@ -91,7 +91,7 @@ Example response:
 {
   "status": "ok",
   "service": "songverse-sonic",
-  "version": "1.6.1",
+  "version": "1.7.0",
   "queue_depth": 0,
   "queued_fast": 0,
   "scheduled_hq": 3,
@@ -104,7 +104,7 @@ Example response:
     "start_hour": 2,
     "end_hour": 7
   },
-  "analysis": { "enabled": true, "backend": "librosa" }
+  "analysis": { "enabled": true, "backend": "librosa", "chords": "btc" }
 }
 ```
 
@@ -136,7 +136,7 @@ Example response:
   "hq_default": "htdemucs_ft",
   "devices": ["cpu"],
   "default_device": "cpu",
-  "analysis": { "enabled": true, "backend": "librosa" }
+  "analysis": { "enabled": true, "backend": "librosa", "chords": "btc" }
 }
 ```
 
@@ -329,7 +329,7 @@ failed
 
 # Music analysis
 
-Since v1.4 a job carries an optional, top-level `analysis` block (next to `fast` and `hq`; `beats`, `downbeats`, `beats_confidence` and `intro_free` were added in v1.5), in
+Since v1.4 a job carries an optional, top-level `analysis` block (next to `fast` and `hq`; `beats`, `downbeats`, `beats_confidence` and `intro_free` were added in v1.5; `chords`, `beat_chords` and `engines` in v1.7), in
 `GET /api/v1/jobs/{id}` and in the `job` object of every webhook payload.
 
 ```json
@@ -346,7 +346,15 @@ Since v1.4 a job carries an optional, top-level `analysis` block (next to `fast`
     { "start": 0.0, "label": "intro" },
     { "start": 8.3, "label": "verse" },
     { "start": 40.1, "label": "chorus" }
-  ]
+  ],
+  "chords": [
+    { "start": 0.0, "end": 0.42, "label": "N" },
+    { "start": 0.42, "end": 3.74, "root": 7, "quality": "maj", "label": "G" },
+    { "start": 3.74, "end": 7.06, "root": 4, "quality": "min7", "label": "E:min7" },
+    { "start": 7.06, "end": 10.38, "root": 0, "quality": "maj", "bass": 4, "label": "C/3" }
+  ],
+  "beat_chords": [1, 1, 1, 1, 2],
+  "engines": { "rhythm": "librosa@1.7.0", "key": "librosa@1.7.0", "sections": "librosa@1.7.0", "chords": "btc@1673d23f8f9a" }
 }
 ```
 
@@ -373,7 +381,10 @@ Since v1.4 a job carries an optional, top-level `analysis` block (next to `fast`
 | `intro_free` | `true`: no steady beat before the first downbeat (a rubato, spoken or free opening), so `first_beat` is where the beat starts. `false`: the beat is steady before it (or there is no intro). Left out when unknown. |
 | `key.name` | Letter `A`-`G`, optional `#` or `b`, then `m` for minor: `G`, `Bb`, `F#m`, `Ebm`. |
 | `sections` | In time order: `start` (seconds) and a lowercase `label`. Labels used: `intro`, `verse`, `pre-chorus`, `chorus`, `bridge`, `inst`, `instrumental`, `solo`, `break`, `interlude`, `outro`, `tag`. |
-| `*.confidence` | 0 to 1 when available; omitted otherwise. |
+| `chords` | Since 1.7, only when the server has chords turned on (`analysis.chords` in `/health`). The recording's chords in time order, not overlapping, within the file: `start`, `end` (seconds), `label`. `"label": "N"` is a stretch with no chord (silence, drums alone) and has nothing else. Otherwise `root` and `bass` are pitch classes, 0 = C to 11 = B, so a client spells them in the song's key (`root: 1` is C# or Db); `bass` is left out when it is the root. `quality` is one of `maj`, `min`, `dim`, `aug`, `min6`, `maj6`, `min7`, `minmaj7`, `maj7`, `7`, `dim7`, `hdim7`, `sus2`, `sus4`. `label` is the chord in Harte's syntax (as `mir_eval` reads it), for display and comparison only: read `root`, `quality` and `bass`. All or nothing, like `beats`. |
+| `beat_chords` | Since 1.7, only with `beats` and `chords`: for each entry of `beats`, the index in `chords` of the chord sounding there (the one heard longest until the next beat), or `null`. Same length as `beats`. |
+| `engines` | Since 1.7: which engine found each part present (`rhythm` for tempo, meter, beats and the first beat; `key`; `sections`; `chords`), as `name@version` (a chord engine's version is the start of its checkpoint's sha256). Parts from different engines are never mixed within one part. |
+| `*.confidence` | 0 to 1 when available; omitted otherwise. `chords` has none: treat them as suggestions. |
 
 Notes on quality: the default backend is heuristic. Tempo is chosen with a prior toward roughly
 60-130 bpm because double/half time cannot be told apart from the audio alone: songs counted faster
@@ -384,7 +395,16 @@ intro to where the music starts (unless the intro is `intro_free`, then it is th
 section labels are a rough guess and boundaries are approximate. Beat times have roughly 10-25 ms of timing resolution. Downbeat placement uses
 kick accents and chord changes, so it can be a beat or a bar off on unusual material.
 
-`GET /api/v1/health` and `GET /api/v1/models` report `analysis.enabled` and `analysis.backend`.
+**Chords and bars (since 1.7).** When chords are on, chord changes also check the bar lines: chords
+change on the first beat of a bar far more often than elsewhere, so when the changes clearly fall on
+another beat of the bar than the downbeats found from the drums, `downbeats` and `first_beat` move
+there (`beats` and `tempo` do not change). Section starts are placed on the nearest of the detected
+`downbeats`, which follow the music when its tempo moves. The chord engine knows the 14 qualities
+above and no inversions yet (`bass` is reserved for engines that find them); it was trained on pop
+and rock recordings, and may call a sus or add9 voicing a plain triad.
+
+`GET /api/v1/health` and `GET /api/v1/models` report `analysis.enabled`, `analysis.backend` and (since 1.7)
+`analysis.chords`: the chord engine, or `null` when chords are off.
 
 ---
 

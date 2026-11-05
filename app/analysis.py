@@ -1,10 +1,11 @@
-"""Music analysis (tempo, first downbeat, meter, key, sections) for finished fast passes.
+"""Music analysis (tempo, beats, meter, key, sections, chords) for finished fast passes.
 
 Everything here is best effort: every field of the result is optional and a
 failure of any step only leaves its fields out. `analyze_job` never raises.
 
 Default backend: librosa (ISC licence, no trained model files) plus small
 heuristics. Optional backend: All-In-One (`ANALYSIS_BACKEND=allin1`), see README.
+Optional chords (`ANALYSIS_CHORDS=btc`): see chords.py.
 """
 from __future__ import annotations
 
@@ -20,9 +21,15 @@ from rhythm import analyze_rhythm
 
 log = logging.getLogger("demucs-api.analysis")
 
+SONIC_VERSION = (Path(__file__).with_name("VERSION").read_text().strip()
+                 if Path(__file__).with_name("VERSION").exists() else "dev")
 ANALYSIS_ENABLED = os.getenv("ANALYSIS_ENABLED", "true").lower() == "true"
 ANALYSIS_BACKEND = os.getenv("ANALYSIS_BACKEND", "librosa").lower()
 ANALYSIS_TIMEOUT = float(os.getenv("ANALYSIS_TIMEOUT_SECONDS", "60"))
+# Chords (issue #15): off by default; "btc" or "btc-chordmini" (see README "Licences").
+ANALYSIS_CHORDS = os.getenv("ANALYSIS_CHORDS", "off").lower()
+# What the chord engine listens to: the whole mix, or the mix without drums and vocals.
+ANALYSIS_CHORDS_INPUT = os.getenv("ANALYSIS_CHORDS_INPUT", "mix").lower()
 
 BPM_RANGE = (20.0, 400.0)
 FIRST_BEAT_RANGE = (0.0, 600.0)
@@ -32,6 +39,10 @@ SECTION_LABELS = {
     "solo", "break", "interlude", "outro", "tag",
 }
 KEY_RE = re.compile(r"^[A-G][#b]?m?$")
+CHORD_QUALITIES = {"maj", "min", "dim", "aug", "min6", "maj6", "min7", "minmaj7", "maj7", "7", "dim7",
+                   "hdim7", "sus2", "sus4"}
+ENGINE_PARTS = {"rhythm", "key", "sections", "chords"}
+ENGINE_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,40}@[A-Za-z0-9._+-]{1,40}$")
 
 SHARP_TO_FLAT_TONIC = ["C", "Db", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
 MINOR_TONIC = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "G#", "A", "Bb", "B"]
@@ -107,6 +118,15 @@ def sanitize_analysis(raw: Any, duration: float | None = None) -> dict | None:
     if isinstance(raw.get("intro_free"), bool):
         out["intro_free"] = raw["intro_free"]
 
+    chords = _chord_list(raw.get("chords"), duration)
+    if chords:
+        out["chords"] = chords
+        per_beat = raw.get("beat_chords")
+        if ("beats" in out and isinstance(per_beat, list) and len(per_beat) == len(out["beats"])
+                and all(c is None or (isinstance(c, int) and not isinstance(c, bool) and 0 <= c < len(chords))
+                        for c in per_beat)):
+            out["beat_chords"] = per_beat
+
     ts = raw.get("time_signature")
     if isinstance(ts, dict):
         n, d = ts.get("numerator"), ts.get("denominator")
@@ -137,7 +157,49 @@ def sanitize_analysis(raw: Any, duration: float | None = None) -> dict | None:
         if clean:
             out["sections"] = clean
 
+    engines = raw.get("engines")
+    if out and isinstance(engines, dict):
+        present = {"rhythm": "tempo" in out or "beats" in out or "time_signature" in out,
+                   "key": "key" in out, "sections": "sections" in out, "chords": "chords" in out}
+        clean_engines = {part: name for part, name in engines.items()
+                         if part in ENGINE_PARTS and present[part] and isinstance(name, str) and ENGINE_RE.match(name)}
+        if clean_engines:
+            out["engines"] = clean_engines
+
     return out or None
+
+
+def _chord_list(value: Any, duration: float | None) -> list[dict] | None:
+    """Chords in order, not overlapping, within the recording; all or nothing, like beats."""
+    if not isinstance(value, list) or not value:
+        return None
+    limit = (duration + 0.5) if duration is not None else FIRST_BEAT_RANGE[1] * 10
+    out: list[dict] = []
+    for c in value:
+        if not isinstance(c, dict):
+            return None
+        start, end = _num(c.get("start")), _num(c.get("end"))
+        if start is None or end is None or start < 0 or end <= start or end > limit:
+            return None
+        start, end = round(start, 3), round(min(end, duration) if duration is not None else end, 3)
+        if end <= start or (out and start < out[-1]["end"]):
+            return None
+        label = c.get("label")
+        if label == "N":
+            out.append({"start": start, "end": end, "label": "N"})
+            continue
+        root, quality, bass = c.get("root"), c.get("quality"), c.get("bass")
+        if (not isinstance(root, int) or isinstance(root, bool) or not 0 <= root <= 11
+                or quality not in CHORD_QUALITIES or not isinstance(label, str) or not label):
+            return None
+        chord = {"start": start, "end": end, "root": root, "quality": quality, "label": label}
+        if bass is not None:
+            if not isinstance(bass, int) or isinstance(bass, bool) or not 0 <= bass <= 11:
+                return None
+            if bass != root:
+                chord["bass"] = bass
+        out.append(chord)
+    return out
 
 
 def key_name(tonic_pc: int, minor: bool) -> str:
@@ -207,7 +269,8 @@ def _key(y_harm, sr: int) -> dict:
     return {"name": key_name(tonic, minor), "confidence": min(1.0, max(0.0, conf))}
 
 
-def _sections(y_mix, y_vocals, sr: int, first_downbeat: float | None, bar_len: float | None) -> list[dict]:
+def _sections(y_mix, y_vocals, sr: int, first_downbeat: float | None, bar_len: float | None,
+              downbeats: list[float] | None = None) -> list[dict]:
     """Heuristic structure: segment on beat-less chroma+MFCC, cluster, label by energy/repetition."""
     import librosa
     import numpy as np
@@ -239,8 +302,13 @@ def _sections(y_mix, y_vocals, sr: int, first_downbeat: float | None, bar_len: f
     bounds = sorted({int(b) for b in bounds} | {0})
     starts = librosa.frames_to_time(bounds, sr=sr, hop_length=hop)
 
-    # Snap boundaries to the bar grid when we have one.
-    if first_downbeat is not None and bar_len and bar_len > 0.5:
+    # Snap boundaries to bar lines: the detected downbeats when there are any (they follow the
+    # music when its tempo moves), else a steady grid from the first downbeat.
+    if downbeats and len(downbeats) >= 2:
+        bars = np.asarray(downbeats)
+        starts = np.array([bars[int(np.argmin(np.abs(bars - t)))] for t in starts])
+        starts = np.clip(starts, 0.0, duration - 1.0)
+    elif first_downbeat is not None and bar_len and bar_len > 0.5:
         starts = np.array([first_downbeat + round((t - first_downbeat) / bar_len) * bar_len for t in starts])
         starts = np.clip(starts, 0.0, duration - 1.0)
     starts[0] = 0.0
@@ -356,17 +424,60 @@ def _analyze_librosa(files: list[Path], source: Path | None, budget: _Budget) ->
     else:
         log.warning("analysis: time budget exhausted before key")
 
+    if ANALYSIS_CHORDS != "off":
+        if budget.ok():
+            try:
+                harmonic = [p for p in (bass, other) if p] or ([no_vocals] if no_vocals else [])
+                y = _mix(harmonic, sr) if ANALYSIS_CHORDS_INPUT == "harmonic" and harmonic else full_mix()
+                result.update(_chords_on_beats(y, sr, result))
+            except Exception:
+                log.exception("analysis: chords step failed")
+        else:
+            log.warning("analysis: time budget exhausted before chords")
+
     if budget.ok():
         try:
             y_voc = _load(vocals, sr) if vocals else None
-            secs = _sections(full_mix(), y_voc, sr, rhythm.get("first_beat"), rhythm.get("_downbeat_period"))
+            secs = _sections(full_mix(), y_voc, sr, result.get("first_beat"), rhythm.get("_downbeat_period"),
+                             result.get("downbeats"))
             if secs:
                 result["sections"] = secs
         except Exception:
             log.exception("analysis: sections step failed")
     else:
         log.warning("analysis: time budget exhausted before sections")
+    result["engines"] = {part: f"librosa@{SONIC_VERSION}" for part in ("rhythm", "key", "sections")}
+    if "chords" in result:
+        result["engines"]["chords"] = _chord_engine_id()
     return result
+
+
+def _chord_engine_id() -> str:
+    import chords
+    spec = chords.CHECKPOINTS.get(ANALYSIS_CHORDS)
+    return f"{ANALYSIS_CHORDS}@{spec.sha256[:12]}" if spec else f"{ANALYSIS_CHORDS}@unknown"
+
+
+def _chords_on_beats(y, sr: int, rhythm: dict) -> dict:
+    """Chords (issue #15), the chord on each beat, and the bar lines moved where the chord changes
+    clearly put them. Returns the fields to add or replace; empty when no chord was found."""
+    import chords
+
+    found = chords.recognize(y, sr, ANALYSIS_CHORDS)
+    if not any(c["label"] != "N" for c in found):
+        return {}
+    out: dict[str, Any] = {"chords": found}
+    beats, downbeats = rhythm.get("beats"), rhythm.get("downbeats")
+    if beats and downbeats:
+        meter = (rhythm.get("time_signature") or {}).get("numerator") or 4
+        phase = chords.bar_phase_from_chords(found, beats, downbeats, meter)
+        if phase is not None:
+            moved = chords.apply_bar_phase(rhythm, phase, meter)
+            log.info("analysis: chord changes moved bar 1 from %.3f s to %.3f s",
+                     rhythm["first_beat"], moved["first_beat"])
+            out["downbeats"], out["first_beat"] = moved["downbeats"], moved["first_beat"]
+        out["beat_chords"] = chords.chords_per_beat(found, beats, len(y) / sr)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -449,12 +560,21 @@ def analyze_job(files: list[Path], source: Path | None, work_dir: Path, device: 
         duration = fallback.pop("_duration", None)
         # Keep All-In-One's values where it had them; fill the rest from librosa. Beats and the
         # fields derived from them travel together, so never mix the two trackers' versions.
-        beat_keys = {"tempo", "first_beat", "beats", "downbeats", "beats_confidence", "intro_free"}
+        beat_keys = {"tempo", "first_beat", "beats", "downbeats", "beats_confidence", "intro_free", "beat_chords"}
+        engines = fallback.pop("engines", {})
+        if raw:
+            primary = f"allin1@{SONIC_VERSION}"
+            if "beats" in raw or "tempo" in raw:
+                engines["rhythm"] = primary
+            for part in ("key", "sections"):
+                if part in raw:
+                    engines[part] = primary
         if "beats" in raw:
             fallback = {k: v for k, v in fallback.items() if k not in beat_keys}
         for k, v in fallback.items():
             if k not in raw:
                 raw[k] = v
+        raw["engines"] = engines
     except Exception:
         log.exception("analysis failed")
     result = sanitize_analysis(raw, duration)
