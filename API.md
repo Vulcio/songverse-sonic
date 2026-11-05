@@ -1,6 +1,6 @@
 # Songverse Sonic API
 
-API version: **1.7.0**
+API version: **1.8.0**
 
 The service provides asynchronous Demucs stem separation with an optional two-stage workflow:
 
@@ -91,7 +91,7 @@ Example response:
 {
   "status": "ok",
   "service": "songverse-sonic",
-  "version": "1.7.0",
+  "version": "1.8.0",
   "queue_depth": 0,
   "queued_fast": 0,
   "scheduled_hq": 3,
@@ -104,7 +104,10 @@ Example response:
     "start_hour": 2,
     "end_hour": 7
   },
-  "analysis": { "enabled": true, "backend": "librosa", "chords": "btc" }
+  "analysis": {
+    "enabled": true, "backend": "librosa", "chords": "btc",
+    "parts": ["rhythm", "key", "sections", "chords"], "analysis_only": true
+  }
 }
 ```
 
@@ -177,6 +180,7 @@ Multipart fields:
 | `hq_not_before` | no | next HQ window | ISO-8601 datetime |
 | `callback_url` | no | | Webhook endpoint |
 | `callback_secret` | no | | HMAC signing secret |
+| `separate` | no | `true` | Since 1.8: `false` for an **analysis-only job** (see below) |
 
 Example: fast now and HQ tonight:
 
@@ -190,6 +194,18 @@ curl -X POST 'https://demucs.example.com/api/v1/jobs' \
   -F 'callback_url=https://app.example.com/hooks/demucs' \
   -F 'callback_secret=YOUR_WEBHOOK_SECRET'
 ```
+
+### Analysis-only jobs
+
+Since 1.8, `separate=false` (a form field here, `"separate": false` in a URL job) analyses the
+recording as it is, without separating it: for recordings already separated elsewhere, or separated
+before the server could find something (chords, since 1.7). The job goes through the same states and
+webhooks: its `fast` stage completes with no `files`, carrying the `analysis` as a separation's does,
+and `fast.completed` is sent; `hq` is always disabled (asking for it is refused, 400). It waits behind
+the separations already queued, before any HQ pass. Refused (400) when the server's analysis is
+turned off: `analysis.analysis_only` in `/health` says whether it takes them. The analysis uses the
+mix only, so it can differ a little from a separation's, which listens to the drums and bass apart.
+A job's `separate` field says which kind it is (`true` for every job before 1.8).
 
 ## Submit a remote URL
 
@@ -218,6 +234,8 @@ Example:
   "callback_secret": "YOUR_WEBHOOK_SECRET"
 }
 ```
+
+`"separate": false` (top level, since 1.8) makes it an [analysis-only job](#analysis-only-jobs); `hq` is then left out.
 
 If `hq.not_before` is omitted, the API schedules the HQ pass for the next configured HQ window. With the defaults, that is the next time the local `Europe/Paris` clock enters **02:00-07:00**.
 
@@ -267,6 +285,7 @@ Example after the fast pass has completed:
   "status": "hq_scheduled",
   "source_name": "song.wav",
   "two_stems": null,
+  "separate": true,
   "error": null,
   "fast": {
     "status": "completed",
@@ -354,7 +373,7 @@ Since v1.4 a job carries an optional, top-level `analysis` block (next to `fast`
     { "start": 7.06, "end": 10.38, "root": 0, "quality": "maj", "bass": 4, "label": "C/3" }
   ],
   "beat_chords": [1, 1, 1, 1, 2],
-  "engines": { "rhythm": "librosa@1.7.0", "key": "librosa@1.7.0", "sections": "librosa@1.7.0", "chords": "btc@1673d23f8f9a" }
+  "engines": { "rhythm": "librosa@1.8.0", "key": "librosa@1.8.0", "sections": "librosa@1.8.0", "chords": "btc@1673d23f8f9a" }
 }
 ```
 
@@ -403,8 +422,14 @@ there (`beats` and `tempo` do not change). Section starts are placed on the near
 above and no inversions yet (`bass` is reserved for engines that find them); it was trained on pop
 and rock recordings, and may call a sus or add9 voicing a plain triad.
 
-`GET /api/v1/health` and `GET /api/v1/models` report `analysis.enabled`, `analysis.backend` and (since 1.7)
-`analysis.chords`: the chord engine, or `null` when chords are off.
+`GET /api/v1/health` and `GET /api/v1/models` report `analysis.enabled`, `analysis.backend`, (since 1.7)
+`analysis.chords`: the chord engine, or `null` when chords are off, and (since 1.8) `analysis.parts`, the
+parts it can find (`rhythm`, `key`, `sections`, `chords`), and `analysis.analysis_only`.
+
+**Time limits.** `ANALYSIS_TIMEOUT_SECONDS` is a budget the analysis checks between its steps (later
+steps are skipped once it is spent). Since 1.8 the analysis also runs in a process of its own, stopped at
+`ANALYSIS_HARD_LIMIT_SECONDS` (default three times the budget, at least 120 s): the job then completes
+without an analysis, as when the analysis fails.
 
 ---
 

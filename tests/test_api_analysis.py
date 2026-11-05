@@ -41,7 +41,7 @@ def test_analysis_exposed_in_job_and_webhook(main):
 
 def test_analysis_failure_does_not_fail_job(main, monkeypatch):
     jid = _job(main)
-    monkeypatch.setattr(main.analysis, "analyze_job", lambda *a, **k: 1 / 0)
+    monkeypatch.setattr(main.analysis, "analyze_job_with_limit", lambda *a, **k: 1 / 0)
     assert main.run_analysis(jid) is None
 
 
@@ -74,7 +74,7 @@ def test_fast_completion_waits_for_analysis(main, monkeypatch, outcome):
 
     monkeypatch.setattr(main, "run_demucs", separate)
     monkeypatch.setattr(main, "upload_r2", lambda *args: None)
-    monkeypatch.setattr(main.analysis, "analyze_job", analyze)
+    monkeypatch.setattr(main.analysis, "analyze_job_with_limit", analyze)
     monkeypatch.setattr(main, "enqueue_notification", notify)
     main.process_stage(jid, "fast")
 

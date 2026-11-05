@@ -26,6 +26,9 @@ SONIC_VERSION = (Path(__file__).with_name("VERSION").read_text().strip()
 ANALYSIS_ENABLED = os.getenv("ANALYSIS_ENABLED", "true").lower() == "true"
 ANALYSIS_BACKEND = os.getenv("ANALYSIS_BACKEND", "librosa").lower()
 ANALYSIS_TIMEOUT = float(os.getenv("ANALYSIS_TIMEOUT_SECONDS", "60"))
+# Past this the analysis process is stopped (issue #7): ANALYSIS_TIMEOUT_SECONDS is a budget its
+# steps check between them, this is the hard limit for a step that never returns.
+ANALYSIS_HARD_LIMIT = float(os.getenv("ANALYSIS_HARD_LIMIT_SECONDS", str(max(120.0, 3 * ANALYSIS_TIMEOUT))))
 # Chords (issue #15): off by default; "btc" or "btc-chordmini" (see README "Licences").
 ANALYSIS_CHORDS = os.getenv("ANALYSIS_CHORDS", "off").lower()
 # What the chord engine listens to: the whole mix, or the mix without drums and vocals.
@@ -541,6 +544,50 @@ def _analyze_allin1(files: list[Path], source: Path | None, work_dir: Path, devi
 # --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
+
+def _child(queue, target, args) -> None:
+    try:
+        queue.put(("ok", target(*args)))
+    except BaseException as exc:  # reported to the parent, which logs it
+        queue.put(("error", repr(exc)))
+
+
+def run_with_hard_limit(target, args: tuple, limit: float):
+    """`target(*args)` in a child process; None when it raises or isn't done within `limit` s,
+    in which case the child is killed. The result must pickle."""
+    import multiprocessing
+    import queue as queues
+
+    ctx = multiprocessing.get_context("spawn")
+    channel = ctx.Queue()
+    process = ctx.Process(target=_child, args=(channel, target, args), daemon=True)
+    process.start()
+    try:
+        status, value = channel.get(timeout=limit)
+    except queues.Empty:
+        log.error("analysis: no result after %.0fs; stopping it", limit)
+        process.kill()
+        process.join(5)
+        return None
+    finally:
+        channel.close()
+    process.join(5)
+    if status != "ok":
+        log.error("analysis: failed in its process: %s", value)
+        return None
+    return value
+
+
+def analyze_job_with_limit(files: list[Path], source: Path | None, work_dir: Path, device: str = "cpu") -> dict | None:
+    """analyze_job in its own process, stopped at ANALYSIS_HARD_LIMIT_SECONDS. Never raises."""
+    if not ANALYSIS_ENABLED:
+        return None
+    try:
+        return run_with_hard_limit(analyze_job, (list(files), source, work_dir, device), ANALYSIS_HARD_LIMIT)
+    except Exception:
+        log.exception("analysis: could not start its process")
+        return None
+
 
 def analyze_job(files: list[Path], source: Path | None, work_dir: Path, device: str = "cpu") -> dict | None:
     """Analyse a job after its fast pass. Never raises; returns a sanitised dict or None."""

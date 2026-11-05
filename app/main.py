@@ -134,6 +134,8 @@ def init_db() -> None:
             "analysis_json": "TEXT",
             "callback_url": "TEXT",
             "callback_secret": "TEXT",
+            # 0: an analysis-only job (since 1.8, issue #7): no Demucs, the recording analysed as it is.
+            "separate": "INTEGER NOT NULL DEFAULT 1",
         }
         for name, declaration in additions.items():
             _add_column(conn, columns, name, declaration)
@@ -243,6 +245,7 @@ def public_job(row: sqlite3.Row) -> dict:
         "hq": stage_public(row, "hq"),
         "analysis": public_analysis(row),
         "callback_configured": bool(row["callback_url"]),
+        "separate": bool(row["separate"]),
     }
 
 
@@ -312,7 +315,15 @@ def create_job(
     hq_not_before: str | None,
     callback_url: str | None,
     callback_secret: str | None,
+    separate: bool = True,
 ) -> str:
+    if not separate:
+        # Analysis only (issue #7): nothing to separate, so no HQ pass and no model to check.
+        if not analysis.ANALYSIS_ENABLED:
+            raise HTTPException(400, "Analysis is turned off on this server: an analysis-only job can't run")
+        if hq_enabled:
+            raise HTTPException(400, "An analysis-only job has no HQ pass")
+        two_stems = None
     validate_two_stems(two_stems)
     selected_fast_device = validate_model_device(fast_model, fast_device)
     selected_hq_model = hq_model or HQ_DEFAULT_MODEL
@@ -329,14 +340,14 @@ def create_job(
                 id,status,model,device,two_stems,source_name,created_at,updated_at,
                 fast_model,fast_device,fast_status,
                 hq_enabled,hq_model,hq_device,hq_status,hq_not_before,
-                callback_url,callback_secret
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                callback_url,callback_secret,separate
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             jid, "queued", fast_model, selected_fast_device, two_stems, source_name, now, now,
             fast_model, selected_fast_device, "queued",
             1 if hq_enabled else 0, selected_hq_model if hq_enabled else None,
             selected_hq_device, "scheduled" if hq_enabled else "disabled", hq_ts,
-            callback_url, callback_secret,
+            callback_url, callback_secret, 1 if separate else 0,
         ))
     return jid
 
@@ -568,10 +579,11 @@ def enqueue_notification(job_id: str, event: str) -> None:
 
 
 def run_analysis(job_id: str) -> dict | None:
+    """The job's analysis, in a child process stopped at ANALYSIS_HARD_LIMIT_SECONDS (issue #7)."""
     try:
         row = get_job(job_id)
         inputs = sorted((JOBS_DIR / job_id / "input").iterdir())
-        return analysis.analyze_job(
+        return analysis.analyze_job_with_limit(
             result_files(job_id, "fast"), inputs[0] if inputs else None,
             JOBS_DIR / job_id, row["fast_device"],
         )
@@ -591,8 +603,11 @@ def process_stage(job_id: str, quality: Literal["fast", "hq"]) -> None:
     if quality == "hq":
         enqueue_notification(job_id, "hq.started")
     try:
-        run_demucs(job_id, quality)
-        r2 = upload_r2(job_id, quality, result_files(job_id, quality))
+        separating = quality == "hq" or bool(get_job(job_id)["separate"])
+        r2 = None
+        if separating:
+            run_demucs(job_id, quality)
+            r2 = upload_r2(job_id, quality, result_files(job_id, quality))
         found = None
         if quality == "fast":
             # Last step of the fast pass: the analysis must be stored before the stage is
@@ -641,6 +656,8 @@ async def enqueue_work(job_id: str, quality: Literal["fast", "hq"]) -> None:
             return
         queued_work.add(key)
         priority = 0 if quality == "fast" else 10
+        if quality == "fast" and not get_job(job_id)["separate"]:
+            priority = 5  # analysis only: after the separations waiting, before HQ passes
         await work_queue.put((priority, time.time(), job_id, quality))
 
 
@@ -760,7 +777,7 @@ async def lifespan(_: FastAPI):
         task.cancel()
 
 
-app = FastAPI(title="Songverse Sonic", version="1.7.0", lifespan=lifespan)
+app = FastAPI(title="Songverse Sonic", version="1.8.0", lifespan=lifespan)
 
 
 class StageRequest(BaseModel):
@@ -777,6 +794,7 @@ class HqRequest(BaseModel):
 
 class UrlJob(BaseModel):
     source_url: HttpUrl
+    separate: bool = True
     fast: StageRequest = StageRequest()
     hq: HqRequest | None = None
     two_stems: str | None = None
@@ -796,6 +814,10 @@ def analysis_info() -> dict:
         "backend": analysis.ANALYSIS_BACKEND if analysis.ANALYSIS_ENABLED else None,
         # Since 1.7: the chord engine, or null when chords are off (issue #15).
         "chords": analysis.ANALYSIS_CHORDS if analysis.ANALYSIS_ENABLED and analysis.ANALYSIS_CHORDS != "off" else None,
+        # Since 1.8 (issue #7): what it can find, and whether it takes analysis-only jobs.
+        "parts": ([] if not analysis.ANALYSIS_ENABLED else
+                  ["rhythm", "key", "sections"] + (["chords"] if analysis.ANALYSIS_CHORDS != "off" else [])),
+        "analysis_only": analysis.ANALYSIS_ENABLED,
     }
 
 
@@ -857,13 +879,14 @@ async def upload_job(
     hq_not_before: str | None = Form(None),
     callback_url: str | None = Form(None),
     callback_secret: str | None = Form(None),
+    separate: bool = Form(True),
 ):
     if callback_url:
         validate_remote_url(callback_url, ALLOW_PRIVATE_CALLBACK_URLS, "callback")
     jid = create_job(
         file.filename or "upload", model, device, two_stems,
         hq_enabled, hq_model, hq_device, hq_not_before,
-        callback_url, callback_secret,
+        callback_url, callback_secret, separate,
     )
     dest = JOBS_DIR / jid / "input" / Path(file.filename or "input.bin").name
     try:
@@ -897,6 +920,7 @@ async def url_job(payload: UrlJob):
         hq.not_before.isoformat() if hq and hq.not_before else None,
         callback,
         payload.callback_secret,
+        payload.separate,
     )
     dest = JOBS_DIR / jid / "input" / Path(name).name
     try:

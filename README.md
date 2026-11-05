@@ -74,7 +74,7 @@ Images are published to GitHub's registry from every push to `main`:
 | `ghcr.io/bricedupuy/songverse-sonic:latest` | CPU (any x86-64 server) |
 | `ghcr.io/bricedupuy/songverse-sonic:cuda` | NVIDIA GPU, with the [NVIDIA container toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/) |
 
-Each is also tagged with the API's version (`1.7.0`, `1.7.0-cuda`) and the commit (`sha-…`).
+Each is also tagged with the API's version (`1.8.0`, `1.8.0-cuda`) and the commit (`sha-…`).
 
 ```bash
 docker run -d --name sonic -p 8000:8000 \
@@ -186,6 +186,7 @@ Settings in `/etc/demucs-api/demucs-api.env`:
 ANALYSIS_ENABLED=true            # false turns it off
 ANALYSIS_BACKEND=librosa         # or allin1 (opt-in, see below)
 ANALYSIS_TIMEOUT_SECONDS=60      # budget; remaining steps are skipped once exceeded
+ANALYSIS_HARD_LIMIT_SECONDS=180  # the analysis process is stopped past this (default 3x the budget, min 120)
 ANALYSIS_CHORDS=off              # btc to find chords (or btc-chordmini, see the licences below)
 ANALYSIS_CHORDS_INPUT=mix        # mix, or harmonic (the stems without drums and vocals)
 ```
