@@ -20,8 +20,12 @@ jobs:
         with:
           python-version: "3.12"
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsndfile1
-      - run: pip install pytest librosa soundfile fastapi httpx boto3 python-multipart
+      - run: pip install pytest librosa soundfile fastapi httpx boto3 python-multipart mir_eval
+      # CPU PyTorch, so the chord tests run with the real model (downloaded and checked on first use).
+      - run: pip install --index-url https://download.pytorch.org/whl/cpu torch
       - run: python -m pytest tests
+      # The built-in synthetic benchmark (issue #9): a smoke test of the harness, not a measure of real music.
+      - run: python benchmarks/run.py --synthetic --chords btc --chords-input mix
       - run: bash -n ct/demucs-api.sh install/demucs-api-install.sh docker/entrypoint.sh
 
   image:
