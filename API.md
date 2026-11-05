@@ -1,6 +1,6 @@
 # Songverse Sonic API
 
-API version: **1.6.0**
+API version: **1.6.1**
 
 The service provides asynchronous Demucs stem separation with an optional two-stage workflow:
 
@@ -91,7 +91,7 @@ Example response:
 {
   "status": "ok",
   "service": "songverse-sonic",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "queue_depth": 0,
   "queued_fast": 0,
   "scheduled_hq": 3,
@@ -670,6 +670,18 @@ DEMUX_ALLOW_PRIVATE_CALLBACK_URLS=false
 ```
 
 Set it to `true` only if your webhook receiver is also on the private network.
+
+When private addresses are disabled (always for webhooks unless allowed, and for sources with
+`DEMUX_ALLOW_PRIVATE_SOURCE_URLS=false`), every address is checked, not only the one submitted (since 1.6.1):
+
+- each redirect a source download follows (5 at most) is checked again before it is fetched;
+- the server connects to the address it checked (the name is resolved once, every address it resolves
+  to must be public, TLS is still verified against the name), so a name can't be pointed at a private
+  address after the check;
+- behind an outbound proxy (`HTTPS_PROXY`), the proxy resolves names: Sonic checks the name of the first
+  address and of every redirect, and the proxy's own rules do the rest.
+
+Webhooks never follow redirects.
 
 ---
 

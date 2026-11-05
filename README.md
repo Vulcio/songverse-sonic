@@ -72,7 +72,7 @@ Images are published to GitHub's registry from every push to `main`:
 | `ghcr.io/bricedupuy/songverse-sonic:latest` | CPU (any x86-64 server) |
 | `ghcr.io/bricedupuy/songverse-sonic:cuda` | NVIDIA GPU, with the [NVIDIA container toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/) |
 
-Each is also tagged with the API's version (`1.6.0`, `1.6.0-cuda`) and the commit (`sha-…`).
+Each is also tagged with the API's version (`1.6.1`, `1.6.1-cuda`) and the commit (`sha-…`).
 
 ```bash
 docker run -d --name sonic -p 8000:8000 \

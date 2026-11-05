@@ -18,7 +18,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Literal
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse, urlunparse
 from zoneinfo import ZoneInfo
 
 import boto3
@@ -353,6 +353,13 @@ async def save_upload(upload: UploadFile, dest: Path) -> None:
             out.write(chunk)
 
 
+def _ip_is_private(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if ip.version == 6 and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+            or ip.is_multicast or ip.is_unspecified)
+
+
 def _host_is_private(hostname: str) -> bool:
     try:
         addresses = socket.getaddrinfo(hostname, None)
@@ -363,7 +370,7 @@ def _host_is_private(hostname: str) -> bool:
             ip = ipaddress.ip_address(item[4][0])
         except ValueError:
             continue
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+        if _ip_is_private(ip):
             return True
     return False
 
@@ -376,21 +383,102 @@ def validate_remote_url(url: str, allow_private: bool, purpose: str) -> None:
         raise HTTPException(400, f"Private-network {purpose} URLs are disabled")
 
 
+# Tests swap in an httpx.MockTransport; None is httpx's own.
+_OUTSIDE_TRANSPORT: httpx.AsyncBaseTransport | None = None
+MAX_REDIRECTS = 5
+
+
+def _checked_address(hostname: str, port: int, purpose: str) -> str:
+    """Resolve a host and return one of its addresses, refusing it if any is private.
+
+    Connecting to the address checked here (not resolving again) is what stops a
+    name from pointing elsewhere between the check and the connection.
+    """
+    try:
+        literal = ipaddress.ip_address(hostname.strip("[]"))
+    except ValueError:
+        literal = None
+    if literal is not None:
+        addresses = [literal]
+    else:
+        try:
+            infos = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+        except socket.gaierror as exc:
+            raise HTTPException(400, f"The {purpose} host could not be resolved") from exc
+        addresses = []
+        for info in infos:
+            try:
+                addresses.append(ipaddress.ip_address(info[4][0]))
+            except ValueError:
+                continue
+        if not addresses:
+            raise HTTPException(400, f"The {purpose} host could not be resolved")
+    if any(_ip_is_private(ip) for ip in addresses):
+        raise HTTPException(400, f"Private-network {purpose} URLs are disabled")
+    # IPv4 first: hosts without IPv6 routing still connect.
+    return str(sorted(addresses, key=lambda ip: ip.version)[0])
+
+
+def _proxied(parsed) -> bool:
+    """Whether httpx will send this URL through a proxy from the environment."""
+    import urllib.request
+    proxies = urllib.request.getproxies()
+    return bool(proxies.get(parsed.scheme) or proxies.get("all")) and not urllib.request.proxy_bypass(parsed.hostname)
+
+
+def _outside_request(client: httpx.AsyncClient, method: str, url: str, allow_private: bool,
+                     purpose: str, **kwargs) -> httpx.Request:
+    """A request to an outside address, pinned to a checked IP unless private ones are allowed."""
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise HTTPException(400, f"Only http/https {purpose} URLs are supported")
+    if allow_private:
+        return client.build_request(method, url, **kwargs)
+    if _proxied(parsed):
+        # The proxy resolves and connects; check the name, as before, and leave the rest to it.
+        validate_remote_url(url, False, purpose)
+        return client.build_request(method, url, **kwargs)
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    ip = _checked_address(parsed.hostname, port, purpose)
+    host = f"[{ip}]" if ":" in ip else ip
+    userinfo = parsed.netloc.rsplit("@", 1)[0] + "@" if "@" in parsed.netloc else ""
+    pinned = urlunparse(parsed._replace(netloc=f"{userinfo}{host}:{port}"))
+    headers = dict(kwargs.pop("headers", None) or {})
+    headers["Host"] = parsed.netloc.rsplit("@", 1)[-1]
+    extensions = {"sni_hostname": parsed.hostname} if parsed.scheme == "https" else {}
+    return client.build_request(method, pinned, headers=headers, extensions=extensions, **kwargs)
+
+
 async def download_url(url: str, dest: Path) -> None:
+    """Download a source, checking every redirect's address as well as the first (issue #14)."""
     validate_remote_url(url, ALLOW_PRIVATE_SOURCE_URLS, "source")
     total = 0
     timeout = httpx.Timeout(30.0, read=600.0)
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        async with client.stream("GET", url) as response:
-            response.raise_for_status()
-            with dest.open("wb") as out:
-                async for chunk in response.aiter_bytes(1024 * 1024):
-                    total += len(chunk)
-                    if total > MAX_UPLOAD:
-                        out.close()
-                        dest.unlink(missing_ok=True)
-                        raise HTTPException(413, "Remote file too large")
-                    out.write(chunk)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False, transport=_OUTSIDE_TRANSPORT) as client:
+        current = url
+        for _ in range(MAX_REDIRECTS + 1):
+            request = _outside_request(client, "GET", current, ALLOW_PRIVATE_SOURCE_URLS, "source")
+            response = await client.send(request, stream=True)
+            try:
+                if response.is_redirect:
+                    location = response.headers.get("location")
+                    if not location:
+                        raise HTTPException(502, "Source redirect without a location")
+                    current = urljoin(current, location)
+                    continue
+                response.raise_for_status()
+                with dest.open("wb") as out:
+                    async for chunk in response.aiter_bytes(1024 * 1024):
+                        total += len(chunk)
+                        if total > MAX_UPLOAD:
+                            out.close()
+                            dest.unlink(missing_ok=True)
+                            raise HTTPException(413, "Remote file too large")
+                        out.write(chunk)
+                return
+            finally:
+                await response.aclose()
+        raise HTTPException(400, "Too many source redirects")
 
 
 def upload_r2(job_id: str, quality: str, files: list[Path]) -> dict | None:
@@ -623,8 +711,11 @@ async def webhook_loop() -> None:
             if row["secret"]:
                 signature = hmac.new(row["secret"].encode(), body, hashlib.sha256).hexdigest()
                 headers["X-Demucs-Signature"] = f"sha256={signature}"
-            async with httpx.AsyncClient(timeout=WEBHOOK_TIMEOUT, follow_redirects=False) as client:
-                response = await client.post(row["url"], content=body, headers=headers)
+            async with httpx.AsyncClient(timeout=WEBHOOK_TIMEOUT, follow_redirects=False,
+                                         transport=_OUTSIDE_TRANSPORT) as client:
+                request = _outside_request(client, "POST", row["url"], ALLOW_PRIVATE_CALLBACK_URLS,
+                                           "callback", content=body, headers=headers)
+                response = await client.send(request)
                 response.raise_for_status()
             with db() as conn:
                 conn.execute(
@@ -669,7 +760,7 @@ async def lifespan(_: FastAPI):
         task.cancel()
 
 
-app = FastAPI(title="Songverse Sonic", version="1.6.0", lifespan=lifespan)
+app = FastAPI(title="Songverse Sonic", version="1.6.1", lifespan=lifespan)
 
 
 class StageRequest(BaseModel):
