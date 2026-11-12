@@ -1,6 +1,6 @@
 # Songverse Sonic API
 
-API version: **1.8.0**
+API version: **1.8.1**
 
 The service provides asynchronous Demucs stem separation with an optional two-stage workflow:
 
@@ -91,7 +91,7 @@ Example response:
 {
   "status": "ok",
   "service": "songverse-sonic",
-  "version": "1.8.0",
+  "version": "1.8.1",
   "queue_depth": 0,
   "queued_fast": 0,
   "scheduled_hq": 3,
@@ -373,7 +373,7 @@ Since v1.4 a job carries an optional, top-level `analysis` block (next to `fast`
     { "start": 7.06, "end": 10.38, "root": 0, "quality": "maj", "bass": 4, "label": "C/3" }
   ],
   "beat_chords": [1, 1, 1, 1, 2],
-  "engines": { "rhythm": "librosa@1.8.0", "key": "librosa@1.8.0", "sections": "librosa@1.8.0", "chords": "btc@1673d23f8f9a" }
+  "engines": { "rhythm": "librosa@1.8.1", "key": "librosa@1.8.1", "sections": "librosa@1.8.1", "chords": "btc@1673d23f8f9a" }
 }
 ```
 
@@ -394,7 +394,7 @@ Since v1.4 a job carries an optional, top-level `analysis` block (next to `fast`
 | `tempo.bpm` | Beats per minute, 20 to 400. |
 | `first_beat` | Seconds from the start of the file to the first downbeat (bar 1, beat 1), 0 to 600. |
 | `time_signature` | `numerator` 1 to 16, `denominator` one of 2, 4, 8, 16. |
-| `beats` | Every beat found, in seconds from the start of the file, strictly increasing, within the file's length, rounded to the millisecond. At the same beat level as `tempo.bpm` (not half or double time). Listed from `first_beat` onward. |
+| `beats` | Every beat found, in seconds from the start of the file, strictly increasing, within the file's length, rounded to the millisecond. Since 1.8.1 each beat is where its hit starts (its attack), not where the onset peaks a few tens of ms later, so a click on them sounds with the recording. At the same beat level as `tempo.bpm` (not half or double time). Listed from `first_beat` onward. |
 | `downbeats` | The first beat of each bar, in seconds. Always a subset of `beats`; the first one is `first_beat`. |
 | `beats_confidence` | 0 to 1, for `beats` and `downbeats` together (low when the beats land on few onsets or the tempo octave is in doubt). Only present with `beats`. |
 | `intro_free` | `true`: no steady beat before the first downbeat (a rubato, spoken or free opening), so `first_beat` is where the beat starts. `false`: the beat is steady before it (or there is no intro). Left out when unknown. |
