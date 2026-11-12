@@ -103,3 +103,62 @@ def make_progression(dirpath, progression, bpm=90.0, bars=16, meter=4, kick_on=0
     for name, y in (("drums", drums), ("bass", bass), ("other", other), ("vocals", np.zeros(n))):
         sf.write(f"{dirpath}/{name}.wav", (y * 0.9).astype("float32"), SR)
     return first, bar, beat
+
+
+def make_sections(dirpath, plan=(("A", 8), ("B", 8), ("A", 8), ("B", 8), ("C", 4), ("B", 8)), bpm=96.0, meter=4, lead=0.4, seed=2):
+    """Sections that differ in chords, bass and drums: A soft (pad, kick on 1), B full (chords
+    changing every two beats, hi-hats on eighths, snare on the backbeat), C sparse (one held chord,
+    no drums). `plan` is (name, bars) in order. Returns (section starts in seconds, bar_sec)."""
+    rng = np.random.default_rng(seed)
+    beat = 60.0 / bpm
+    bar = beat * meter
+    total_bars = sum(b for _, b in plan)
+    n = int((lead + total_bars * bar + 1.0) * SR)
+    drums, bass, other = np.zeros(n), np.zeros(n), np.zeros(n)
+    k = np.arange(int(0.15 * SR)) / SR
+    kick = np.sin(2 * np.pi * 55 * k) * np.exp(-k * 28)
+    snare = rng.standard_normal(len(k)) * np.exp(-k * 35) * 0.6
+    hat = np.diff(rng.standard_normal(len(k) + 2), 2) * np.exp(-k * 90) * 0.15
+
+    def hit(buf, at, sig):
+        s = int(at * SR)
+        if s < n:
+            e = min(n, s + len(sig))
+            buf[s:e] += sig[: e - s]
+
+    def chord(at, length, freqs, level):
+        i0, i1 = int(at * SR), min(n, int((at + length) * SR))
+        seg = np.arange(i1 - i0) / SR
+        env = np.minimum(1, seg / 0.02) * np.exp(-seg * 0.5)
+        other[i0:i1] += sum(np.sin(2 * np.pi * f * seg) + 0.4 * np.sin(4 * np.pi * f * seg) for f in freqs) * level * env
+        bass[i0:i1] += np.sin(2 * np.pi * freqs[0] / 2 * seg) * 0.25 * env
+
+    progressions = {
+        "A": [(261.63, 329.63, 392.0), (196.0, 246.94, 293.66)],                       # C G
+        "B": [(220.0, 261.63, 329.63), (174.61, 220.0, 261.63), (196.0, 246.94, 293.66), (261.63, 329.63, 392.0)],  # Am F G C
+        "C": [(293.66, 349.23, 440.0)],                                                  # Dm
+    }
+    starts, t = [], lead
+    for name, bars in plan:
+        starts.append(t)
+        for b in range(bars):
+            t0 = t + b * bar
+            prog = progressions[name]
+            if name == "B":
+                for half in range(2):
+                    chord(t0 + half * bar / 2, bar / 2, prog[(2 * b + half) % len(prog)], 0.07)
+            else:
+                chord(t0, bar, prog[b % len(prog)], 0.05 if name == "A" else 0.04)
+            for j in range(meter):
+                at = t0 + j * beat
+                if name == "A":
+                    if j == 0:
+                        hit(drums, at, kick * 0.7)
+                elif name == "B":
+                    hit(drums, at, kick if j % 2 == 0 else snare)
+                    hit(drums, at, hat)
+                    hit(drums, at + beat / 2, hat)
+        t += bars * bar
+    for name, y in (("drums", drums), ("bass", bass), ("other", other), ("vocals", np.zeros(n))):
+        sf.write(f"{dirpath}/{name}.wav", (y * 0.9).astype("float32"), SR)
+    return starts, bar

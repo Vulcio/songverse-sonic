@@ -272,6 +272,63 @@ def _key(y_harm, sr: int) -> dict:
     return {"name": key_name(tonic, minor), "confidence": min(1.0, max(0.0, conf))}
 
 
+def _bar_boundaries(F, downbeats, sr: int, hop: int):
+    """Section starts at bar lines where the music changes most (seconds, the first one 0.0), or
+    None when there are too few bars to judge.
+
+    Each bar is summed up by its mean features. A bar line's novelty compares the 4 bars before
+    it with the 4 after (and 2 with 2, for short sections). Peaks at least 4 bars apart, clearly
+    above the song's usual change, are section starts. Between two bar lines that change about as
+    much, the one that keeps sections a multiple of 4 bars long wins: songs move in phrases.
+    """
+    import numpy as np
+
+    frames = np.round(downbeats * sr / hop).astype(int)
+    step = int(np.median(np.diff(frames))) if len(frames) > 1 else 0
+    frames = frames[frames + step <= F.shape[1]]          # whole bars only: not the silence at the end
+    if len(frames) < 16:
+        return None
+    ends = np.append(frames[1:], frames[-1] + step)
+    bars = np.array([F[:, a:max(a + 1, b)].mean(axis=1) for a, b in zip(frames, ends)])
+    nb = len(bars)
+
+    def novelty(w):
+        out = np.zeros(nb)
+        for k in range(1, nb):
+            lo, hi = bars[max(0, k - w):k], bars[k:min(nb, k + w)]
+            out[k] = float(np.linalg.norm(lo.mean(axis=0) - hi.mean(axis=0)))
+        return out
+
+    nov = novelty(4) + 0.5 * novelty(2)
+    nov[0] = 0.0
+    if nov.max() <= 0:
+        return None
+    usual = float(np.median(nov[1:]))
+    level = usual + 1.4826 * float(np.median(np.abs(nov[1:] - usual)))   # robust: one huge change doesn't hide the rest
+    peaks = [k for k in range(1, nb)
+             if nov[k] >= level and nov[k] == nov[max(1, k - 2):min(nb, k + 3)].max()]
+    chosen = [0]
+    for k in sorted(peaks, key=lambda k: -nov[k]):
+        if all(abs(k - c) >= 4 for c in chosen):
+            chosen.append(k)
+    chosen.sort()
+    # Phrases: move a start by one bar when that bar changes nearly as much and the section
+    # before it then lasts a multiple of 4 bars.
+    for i in range(1, len(chosen)):
+        k, prev = chosen[i], chosen[i - 1]
+        if (k - prev) % 4 == 0:
+            continue
+        for alt in (k - 1, k + 1):
+            nxt = chosen[i + 1] if i + 1 < len(chosen) else nb + 4
+            if 1 <= alt < nb and (alt - prev) % 4 == 0 and alt - prev >= 4 and nxt - alt >= 4 \
+                    and nov[alt] >= 0.85 * nov[k]:
+                chosen[i] = alt
+                break
+    starts = np.array([downbeats[k] for k in chosen], dtype=float)
+    starts[0] = 0.0
+    return starts
+
+
 def _sections(y_mix, y_vocals, sr: int, first_downbeat: float | None, bar_len: float | None,
               downbeats: list[float] | None = None) -> list[dict]:
     """Heuristic structure: segment on beat-less chroma+MFCC, cluster, label by energy/repetition."""
@@ -301,13 +358,23 @@ def _sections(y_mix, y_vocals, sr: int, first_downbeat: float | None, bar_len: f
     k = min(k, n // 4)
     if k < 2:
         return []
-    bounds = librosa.segment.agglomerative(feats, k)
-    bounds = sorted({int(b) for b in bounds} | {0})
-    starts = librosa.frames_to_time(bounds, sr=sr, hop_length=hop)
+    bar_starts = None
+    if downbeats and len(downbeats) >= 16:
+        # Sections start on bar lines, so look for them there: how much the music changes from the
+        # bars before each bar line to the bars after it (issue #21).
+        bar_starts = _bar_boundaries(np.vstack([z(chroma), z(mfcc), z(rms[None, :])]), np.asarray(downbeats), sr, hop)
+    if bar_starts is not None:
+        starts = bar_starts
+    else:
+        bounds = librosa.segment.agglomerative(feats, k)
+        bounds = sorted({int(b) for b in bounds} | {0})
+        starts = librosa.frames_to_time(bounds, sr=sr, hop_length=hop)
 
     # Snap boundaries to bar lines: the detected downbeats when there are any (they follow the
     # music when its tempo moves), else a steady grid from the first downbeat.
-    if downbeats and len(downbeats) >= 2:
+    if bar_starts is not None:
+        starts = np.clip(starts, 0.0, duration - 1.0)
+    elif downbeats and len(downbeats) >= 2:
         bars = np.asarray(downbeats)
         starts = np.array([bars[int(np.argmin(np.abs(bars - t)))] for t in starts])
         starts = np.clip(starts, 0.0, duration - 1.0)
@@ -533,6 +600,12 @@ def _analyze_allin1(files: list[Path], source: Path | None, work_dir: Path, devi
         label = _AIO_LABELS.get(str(seg.label).lower())
         if label:
             secs.append({"start": float(seg.start), "label": label})
+    if secs and out.get("downbeats"):
+        # On its own bar lines, like the built-in engine's: a section is looped and cued by bars.
+        bars = out["downbeats"]
+        for sec in secs:
+            sec["start"] = min(bars, key=lambda t: abs(t - sec["start"]))
+        secs = [sec for i, sec in enumerate(secs) if i == 0 or sec["start"] > secs[i - 1]["start"]]
     if secs:
         secs[0]["start"] = 0.0
         out["sections"] = secs

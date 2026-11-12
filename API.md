@@ -417,8 +417,10 @@ kick accents and chord changes, so it can be a beat or a bar off on unusual mate
 **Chords and bars (since 1.7).** When chords are on, chord changes also check the bar lines: chords
 change on the first beat of a bar far more often than elsewhere, so when the changes clearly fall on
 another beat of the bar than the downbeats found from the drums, `downbeats` and `first_beat` move
-there (`beats` and `tempo` do not change). Section starts are placed on the nearest of the detected
-`downbeats`, which follow the music when its tempo moves. The chord engine knows the 14 qualities
+there (`beats` and `tempo` do not change). Section starts (after the first, at 0) are always one
+of the reported `downbeats`, which follow the music when its tempo moves, so a client can cue or loop
+a section on whole bars. Since 1.8.1 they are found at the bar lines where the music changes most,
+preferring sections a multiple of 4 bars long, and `allin1`'s are placed on its downbeats too. The chord engine knows the 14 qualities
 above and no inversions yet (`bass` is reserved for engines that find them); it was trained on pop
 and rock recordings, and may call a sus or add9 voicing a plain triad.
 

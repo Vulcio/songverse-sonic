@@ -379,9 +379,9 @@ def analyze_rhythm(y_full, y_rhythm, sr: int, y_drums=None, y_harm=None) -> dict
     if np.any(np.diff(T) <= 0):
         return result
     if own.any():
-        # Past the last hit the tracker runs on into the ring-out (or onto the last hi-hats, out of
-        # step): those are not beats.
-        last = int(np.nonzero(own)[0][-1]) + 1
+        # At the end the tracker can run out of step (onto the last hi-hats, into the ring-out):
+        # those are not beats. (Beats past the last onset go below, with the onsets.)
+        last = len(T)
         step = float(np.median(np.diff(T)))
         while last > 8 and abs((T[last - 1] - T[last - 2]) - step) > 0.08 * step:
             last -= 1
