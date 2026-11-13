@@ -5,17 +5,24 @@ Not part of the test suite: run it by hand, on a set of songs kept outside Git.
     pip install mir_eval            # MIT; torch too for the chord engines
     python benchmarks/run.py --synthetic                      # built-in cases, no data needed
     python benchmarks/run.py /path/to/set --chords btc btc-chordmini --chords-input mix harmonic
+    pip install beat_this           # MIT code and weights; the checkpoint downloads from JKU on first use
+    python benchmarks/run.py /path/to/set --chords --beats sonic beat_this --beats-input mix drums
 
 A set is a folder with one folder per song:
 
     song-name/
       mix.wav | mix.mp3 | mix.flac          the recording (or the stems below, or both)
       drums.wav bass.wav other.wav vocals.wav   optional Demucs stems (used like Sonic uses them)
-      annotations.json                      what is true, every part optional:
+      click.wav                             optional: a multitrack's click stem, read as the true beats
+                                            and bars when annotations.json has none (truth_from_click)
+      annotations.json                      what is true, every part optional (optional with a click):
         {"beats": [s, ...], "downbeats": [s, ...], "time_signature": 4,
          "chords": [{"start": s, "end": s, "label": "C:min7"}, ...],   (Harte labels, as mir_eval)
          "sections": [{"start": s, "label": "verse"}, ...],
          "notes": "free text: who annotated it, what is uncertain"}
+
+The mix must not hold the click: export it from the multitrack without the click stem, or give the
+other stems. A click that also clicks subdivisions shows up as tempo ratio 0.5.
 
 The report (JSON, plus a Markdown table on stdout) names Sonic's version, each engine and
 checkpoint, and every input's sha256, so two runs can be compared.
@@ -57,6 +64,88 @@ def find_audio(folder: Path, name: str) -> Path | None:
         if (folder / f"{name}{ext}").exists():
             return folder / f"{name}{ext}"
     return None
+
+
+# --------------------------------------------------------------------------- #
+# Truth from a click track
+# --------------------------------------------------------------------------- #
+
+def truth_from_click(path: Path, music_starts: float | None = None) -> dict:
+    """The beats and bars a multitrack's click stem plays (issue #9): real songs as their band plays
+    them, without annotating by hand. Each click's time is its attack (the first sample reaching
+    half its peak); the downbeats are the clicks set apart by a higher pitch or a louder level, when
+    one is (a click that accents nothing gives beats only). Clicks before `music_starts` (a count-in)
+    are dropped, keeping half a beat of slack."""
+    import librosa
+
+    y, sr = librosa.load(path, sr=22050, mono=True)
+    a = np.abs(y)
+    if not len(a) or a.max() <= 0:
+        return {}
+    hop = 32
+    frames = librosa.util.frame(np.pad(a, (0, hop)), frame_length=hop, hop_length=hop).max(axis=0)
+    on = frames > 0.1 * frames.max()
+    starts = np.flatnonzero(on & ~np.r_[False, on[:-1]])
+    clicks: list[tuple[float, float, float]] = []   # (time, peak, pitch)
+    gap = int(0.06 * sr)
+    for f in starts:
+        s = f * hop
+        if clicks and s / sr - clicks[-1][0] < gap / sr:
+            continue                                  # the same click ringing on
+        seg = y[max(0, s - hop): s + int(0.03 * sr)]
+        peak = float(np.abs(seg).max())
+        attack = max(0, s - hop) + int(np.flatnonzero(np.abs(seg) >= 0.5 * peak)[0])
+        spec = np.abs(np.fft.rfft(seg * np.hanning(len(seg)), n=8192))
+        pitch = float(np.argmax(spec[8:]) + 8) * sr / 8192
+        clicks.append((attack / sr, peak, pitch))
+    if len(clicks) < 8:
+        return {}
+    times = np.array([c[0] for c in clicks])
+    if music_starts is not None:
+        beat = float(np.median(np.diff(times)))
+        keep = times >= music_starts - beat / 2
+        clicks = [c for c, k in zip(clicks, keep) if k]
+        times = times[keep]
+    out: dict = {"beats": [round(float(t), 4) for t in times]}
+
+    def two_groups(values: np.ndarray, ratio: float) -> np.ndarray | None:
+        """A mask of the rarer of two clearly separate groups, or None."""
+        order = np.sort(np.log(values))
+        jumps = np.diff(order)
+        i = int(np.argmax(jumps)) if len(jumps) else 0
+        if not len(jumps) or jumps[i] < np.log(ratio):
+            return None
+        high = np.log(values) > order[i]
+        return high if high.sum() <= (~high).sum() else ~high
+
+    for values, ratio in ((np.array([c[2] for c in clicks]), 1.08), (np.array([c[1] for c in clicks]), 1.25)):
+        accents = two_groups(values, ratio)
+        if accents is None:
+            continue
+        idx = np.flatnonzero(accents)
+        spacing = np.diff(idx)
+        if len(spacing) == 0:
+            break
+        meter = int(np.bincount(spacing).argmax())
+        if meter >= 2 and np.mean(spacing == meter) >= 0.8:
+            out["downbeats"] = [round(float(times[i]), 4) for i in idx]
+            out["time_signature"] = meter
+        break
+    return out
+
+
+def music_start(paths: list[Path], sr: int = 22050) -> float | None:
+    """When the music (anything but the click) first sounds: within 40 dB of its loudest moment."""
+    import librosa
+
+    if not paths:
+        return None
+    y = sum(librosa.load(p, sr=sr, mono=True)[0] for p in paths)
+    rms = librosa.feature.rms(y=y, frame_length=1024, hop_length=256)[0]
+    if not len(rms) or rms.max() <= 0:
+        return None
+    first = int(np.flatnonzero(rms >= rms.max() * 0.01)[0])
+    return first * 256 / sr
 
 
 # --------------------------------------------------------------------------- #
@@ -137,15 +226,60 @@ class Budget:
         return True
 
 
-def run_song(folder: Path, chord_engines: list[str], chord_inputs: list[str]) -> dict:
+class BeatThis:
+    """Beat This! (Foscarin et al., ISMIR 2024; code and weights MIT), a candidate beat and downbeat
+    engine for #9 and #18, run here only, never by the server. Its own minimal post-processing:
+    madmom's DBN is left out, its models being CC BY-NC-SA."""
+
+    def __init__(self, checkpoint: str):
+        from beat_this.inference import Audio2Beats  # pip install beat_this
+
+        self.checkpoint = checkpoint
+        self.run = Audio2Beats(checkpoint_path=checkpoint, device="cpu", dbn=False)
+
+    @property
+    def name(self) -> str:
+        path = Path(self.checkpoint)
+        return f"beat_this@{sha256(path)[:12] if path.exists() else self.checkpoint}"
+
+    def __call__(self, y: np.ndarray, sr: int) -> dict:
+        beats, downbeats = self.run(y, sr)
+        beats, downbeats = [float(b) for b in beats], [float(d) for d in downbeats]
+        found: dict = {"beats": beats, "downbeats": downbeats}
+        if downbeats:
+            found["first_beat"] = downbeats[0]
+            per_bar = [sum(1 for b in beats if a - 0.02 <= b < z - 0.02) for a, z in zip(downbeats, downbeats[1:])]
+            if per_bar:
+                found["time_signature"] = {"numerator": int(np.bincount(per_bar).argmax())}
+        return found
+
+
+def candidate_input(which: str, mix: Path | None, stems: list[Path], sr: int) -> np.ndarray | None:
     import librosa
 
-    truth = json.loads((folder / "annotations.json").read_text())
+    if which == "drums":
+        drums = [p for p in stems if p.stem == "drums"]
+        return librosa.load(drums[0], sr=sr, mono=True)[0] if drums else None
+    if mix:
+        return librosa.load(mix, sr=sr, mono=True)[0]
+    return sum(librosa.load(p, sr=sr, mono=True)[0] for p in stems) if stems else None
+
+
+def run_song(folder: Path, chord_engines: list[str], chord_inputs: list[str],
+             beat_engines: list | None = None, beat_inputs: list[str] = ("mix",)) -> dict:
+    import librosa
+
+    notes = folder / "annotations.json"
+    truth = json.loads(notes.read_text()) if notes.exists() else {}
     mix = find_audio(folder, "mix")
     stems = [p for p in (find_audio(folder, s) for s in STEMS) if p]
     files = stems if stems else []
-    inputs = {p.name: sha256(p) for p in ([mix] if mix else []) + stems}
-    report: dict = {"song": folder.name, "inputs": inputs, "notes": truth.get("notes")}
+    click = find_audio(folder, "click")
+    if click and not truth.get("beats"):
+        heard = truth_from_click(click, music_start([mix] if mix else stems))
+        truth = {**heard, **truth, "truth": "click"}
+    inputs = {p.name: sha256(p) for p in ([mix] if mix else []) + stems + ([click] if click else [])}
+    report: dict = {"song": folder.name, "inputs": inputs, "notes": truth.get("notes"), "truth": truth.get("truth", "annotations")}
 
     t0, cpu0 = time.perf_counter(), time.process_time()
     raw = analysis._analyze_librosa(files, mix, Budget())
@@ -155,6 +289,25 @@ def run_song(folder: Path, chord_engines: list[str], chord_inputs: list[str]) ->
     found = analysis.sanitize_analysis(raw, duration) or {}
     report["rhythm"] = rhythm_metrics(found, truth)
     report["found"] = {k: found.get(k) for k in ("tempo", "time_signature", "first_beat", "key")}
+
+    # Other beat engines on the same song, on the mix and on the drums stem (#18: does isolating the
+    # drums help?), scored the same way. Sonic itself is the "rhythm" above.
+    report["beats"] = {}
+    for engine in beat_engines or []:
+        for which in beat_inputs:
+            y = candidate_input(which, mix, stems, 22050)
+            if y is None:
+                continue
+            t0, cpu0 = time.perf_counter(), time.process_time()
+            try:
+                other = engine(y, 22050)
+            except Exception as exc:  # report the failure, keep going
+                report["beats"][f"{engine.name}/{which}"] = {"error": str(exc)[:300]}
+                continue
+            result = rhythm_metrics(other, truth)
+            result["seconds"] = round(time.perf_counter() - t0, 2)
+            result["cpu_seconds"] = round(time.process_time() - cpu0, 2)
+            report["beats"][f"{engine.name.split('@')[0]}/{which}"] = result
 
     report["chords"] = {}
     if chord_engines:
@@ -213,9 +366,16 @@ def synthetic_set(dest: Path) -> Path:
         prog = kw["progression"]
         truth_chords = [{"start": round(first + b * bar, 3), "end": round(first + (b + 1) * bar, 3),
                          "label": chord_engine.harte_label(*prog[b % len(prog)])} for b in range(kw["bars"])]
-        (folder / "annotations.json").write_text(json.dumps({
-            "beats": beats, "downbeats": beats[::meter], "time_signature": meter, "chords": truth_chords,
-            "notes": "synthetic (tests/synth.py make_progression)"}))
+        if name == "pop-4-4":
+            # The same song as a multitrack with a click stem: its beats and bars are read from the click.
+            from synth import make_click
+            make_click(folder / "click.wav", beats, beats[::meter], duration=first + (kw["bars"] + 1) * bar)
+            (folder / "annotations.json").write_text(json.dumps({
+                "chords": truth_chords, "notes": "synthetic, beats and bars from its click (tests/synth.py)"}))
+        else:
+            (folder / "annotations.json").write_text(json.dumps({
+                "beats": beats, "downbeats": beats[::meter], "time_signature": meter, "chords": truth_chords,
+                "notes": "synthetic (tests/synth.py make_progression)"}))
         # A mix as well, for the mix input.
         y = sum(sf.read(folder / f"{s}.wav")[0] for s in STEMS)
         sf.write(folder / "mix.wav", y.astype("float32"), 22050)
@@ -224,13 +384,21 @@ def synthetic_set(dest: Path) -> Path:
 
 def table(reports: list[dict]) -> str:
     keys = sorted({k for r in reports for k in r["chords"]})
-    lines = ["| song | beat F | downbeat F | 1st downbeat err (s) | tempo ratio | " +
-             " | ".join(f"{k} majmin / per-beat / downbeat F after" for k in keys) + " |",
-             "|" + "---|" * (5 + len(keys))]
+    beat_keys = sorted({k for r in reports for k in r.get("beats", {})})
+    head = ["song", "beat F", "downbeat F", "1st downbeat err (s)", "tempo ratio"]
+    head += [f"{k} beat F / downbeat F / 1st err" for k in beat_keys]
+    head += [f"{k} majmin / per-beat / downbeat F after" for k in keys]
+    lines = ["| " + " | ".join(head) + " |",
+             "|" + "---|" * (5 + len(beat_keys) + len(keys))]
     for r in reports:
         rh = r["rhythm"]
         cells = [r["song"], f'{rh.get("beat_f", float("nan")):.2f}', f'{rh.get("downbeat_f", float("nan")):.2f}',
                  str(rh.get("first_downbeat_error", "-")), str(rh.get("tempo_ratio", "-"))]
+        for k in beat_keys:
+            b = r.get("beats", {}).get(k, {})
+            cells.append("error" if "error" in b else
+                         f'{b.get("beat_f", float("nan")):.2f} / {b.get("downbeat_f", float("nan")):.2f} / '
+                         f'{b.get("first_downbeat_error", "-")}')
         for k in keys:
             c = r["chords"].get(k, {})
             if "error" in c:
@@ -249,24 +417,39 @@ def main(argv=None) -> int:
     parser.add_argument("--synthetic", action="store_true", help="run the built-in synthetic cases")
     parser.add_argument("--chords", nargs="*", default=["btc"], help="chord engines (empty for none)")
     parser.add_argument("--chords-input", nargs="*", default=["mix", "harmonic"], choices=["mix", "harmonic"])
+    parser.add_argument("--beats", nargs="*", default=["sonic"], choices=["sonic", "beat_this"],
+                        help="beat engines to compare (Sonic always runs)")
+    parser.add_argument("--beats-input", nargs="*", default=["mix", "drums"], choices=["mix", "drums"])
+    parser.add_argument("--beat-this-checkpoint", default="final0",
+                        help="Beat This! checkpoint: a name (downloaded from JKU) or a local .ckpt")
     parser.add_argument("--out", type=Path, help="where to write the JSON report")
     args = parser.parse_args(argv)
     if not args.set and not args.synthetic:
         parser.error("give a set folder or --synthetic")
+    beat_engines = []
+    if "beat_this" in args.beats:
+        try:
+            beat_engines.append(BeatThis(args.beat_this_checkpoint))
+        except Exception as exc:
+            parser.error(f"Beat This! couldn't load its checkpoint {args.beat_this_checkpoint!r} ({exc}). "
+                         "Install it with pip install beat_this; without access to cloud.cp.jku.at, "
+                         "download the .ckpt elsewhere and give its path.")
 
     with tempfile.TemporaryDirectory() as tmp:
         folder = synthetic_set(Path(tmp)) if args.synthetic else args.set
-        songs = sorted(p for p in folder.iterdir() if (p / "annotations.json").exists())
+        songs = sorted(p for p in folder.iterdir()
+                       if (p / "annotations.json").exists() or find_audio(p, "click"))
         reports = []
         for song in songs:
             print(f"… {song.name}", file=sys.stderr)
-            reports.append(run_song(song, args.chords, args.chords_input))
+            reports.append(run_song(song, args.chords, args.chords_input, beat_engines, args.beats_input))
     peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
     report = {
         "sonic_version": analysis.SONIC_VERSION,
         "engines": {"rhythm": f"librosa@{analysis.SONIC_VERSION}",
                     **{e: f"{e}@{chord_engine.CHECKPOINTS[e].sha256[:12]}" for e in args.chords
-                       if e in chord_engine.CHECKPOINTS}},
+                       if e in chord_engine.CHECKPOINTS},
+                    **{e.name.split("@")[0]: e.name for e in beat_engines}},
         "set": "synthetic" if args.synthetic else str(args.set),
         "peak_memory_mb": round(peak_mb),
         "songs": reports,
