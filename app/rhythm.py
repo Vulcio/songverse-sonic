@@ -496,6 +496,21 @@ def analyze_rhythm(y_full, y_rhythm, sr: int, y_drums=None, y_harm=None) -> dict
     downbeats_r = np.round(downbeats, 3)
     if np.any(np.diff(beats_r) <= 0):
         return result
+    if meter == 4:
+        # 6/8 counted as 4/4 (with the drums' stem: a kick on 1 and a snare on 4 also make a 4/4
+        # half-time bar): the same bar, but the band plays its sixths, not its quarters.
+        compound = _sixths_bar(y_drums if y_drums is not None else y_rhythm, y_harm, sr, beats_r, downbeats_r)
+        if compound is not None:
+            beats_r, downbeats_r = compound
+            result["time_signature"] = {**result["time_signature"], "numerator": 6, "denominator": 8}
+    if meter == 3:
+        # 6/8 counted as 3/4: the same bar, but felt as two groups of three eighths. The kick and
+        # snare then hit halfway through the bar (the second dotted quarter), and hardly on the
+        # 2nd and 3rd quarters, where a 3/4 band plays. Count the eighths then.
+        compound = _compound_bar(y_drums if y_drums is not None else y_rhythm, sr, hop, beats_r, downbeats_r)
+        if compound is not None:
+            beats_r, downbeats_r = compound
+            result["time_signature"] = {**result["time_signature"], "numerator": 6, "denominator": 8}
     result["tempo"]["bpm"] = 60.0 / float(np.median(np.diff(beats_r)))
     result["first_beat"] = float(downbeats_r[0])
     result["beats"] = [float(t) for t in beats_r]
@@ -506,6 +521,112 @@ def analyze_rhythm(y_full, y_rhythm, sr: int, y_drums=None, y_harm=None) -> dict
     result["beats_confidence"] = min(on_onset, tempo_conf)
     result["_downbeat_period"] = bar_est
     return result
+
+
+def _sixths_bar(y, y_harm, sr: int, beats, downbeats):
+    """(beats, downbeats) in eighths when a bar found as four beats is 6/8: its parts play on
+    sixths of the bar (its eighths) and hardly on its 2nd and 4th quarters, where a 4/4 band
+    plays (a shuffle's triplets fall on twelfths, not here). Else None."""
+    import librosa
+    import numpy as np
+
+    downbeats = np.asarray(downbeats, float)
+    if len(downbeats) < 8:
+        return None
+    hop = 256
+    envs = []
+    for part in (y, y_harm):
+        if part is not None and np.abs(part).max() > 1e-3:
+            env = librosa.onset.onset_strength(y=part, sr=sr, hop_length=hop)
+            if env.max() > 0:
+                envs.append(env / float(np.percentile(env, 99) or env.max()))
+    if not envs:
+        return None
+    n = min(len(e) for e in envs)
+    env = sum(e[:n] for e in envs)
+
+    def at(t):
+        i = int(round(t * sr / hop))
+        return float(env[max(0, i - 1): i + 2].max()) if 0 <= i < n else 0.0
+
+    sixths, quarters = [], []
+    for a, b in zip(downbeats[:-1], downbeats[1:]):
+        bar = b - a
+        sixths.append(np.mean([at(a + bar * k / 6) for k in (1, 2, 4, 5)]))
+        quarters.append(np.mean([at(a + bar * k / 4) for k in (1, 3)]))
+    sixths, quarters = np.array(sixths), np.array(quarters)
+    if sixths.mean() < 1.5 * quarters.mean() or np.mean(sixths > quarters) < 0.65:
+        return None
+    return _eighths(y, sr, downbeats)
+
+
+def _eighths(y, sr: int, downbeats):
+    """Six eighths to each bar, each on its attack where it has one; the downbeats every sixth."""
+    import numpy as np
+
+    grid = [a + (b - a) * k / 6 for a, b in zip(downbeats[:-1], downbeats[1:]) for k in range(6)]
+    grid.append(downbeats[-1])
+    grid = np.asarray(grid, float)
+    eighth = float(np.median(np.diff(grid)))
+    snapped, _ = _snap_to_attacks(grid, _attack_curve(y, sr), sr, eighth)
+    snapped[::6] = downbeats                      # bar lines stay where they were found
+    eighths = np.round(snapped, 3)
+    if not np.all(np.diff(eighths) > 0):
+        return None
+    return eighths, eighths[::6]
+
+
+def _compound_bar(y, sr: int, hop: int, beats, downbeats):
+    """(beats, downbeats) in eighths when bars found as three beats are 6/8 (two groups of three
+    eighths), else None. Two ways a 6/8 song is heard as 3/4:
+    - its bar as three quarters: the kick and snare (below 2 kHz: not the hi-hats, which play
+      every eighth either way) then hit halfway through the bar, hardly on its 2nd and 3rd beats;
+    - each half bar as a bar of three eighths: the kick then starts one "bar" in two, the snare
+      the others."""
+    import librosa
+    import numpy as np
+
+    if len(downbeats) < 8:
+        return None
+    beats, downbeats = np.asarray(beats, float), np.asarray(downbeats, float)
+    body = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop, fmax=2000)
+    if not len(body) or body.max() <= 0:
+        return None
+
+    def at(t, env=body):
+        i = int(round(t * sr / hop))
+        return float(env[max(0, i - 1): i + 2].max()) if 0 <= i < len(env) else 0.0
+
+    kick = _kick_flux(y, sr, hop)
+    if kick.max() > 0:
+        k = np.array([at(t, kick) for t in downbeats])
+        for phase in (0, 1):
+            on, off = k[phase::2], k[1 - phase::2]
+            m = min(len(on), len(off))
+            on, off = on[:m], off[:m]
+            if len(on) >= 4 and on.mean() > 0.3 * float(np.percentile(kick, 99)) and np.mean(on > 2 * off) >= 0.75:
+                return beats, downbeats[phase::2]
+
+    half, thirds = [], []
+    for a, b in zip(downbeats[:-1], downbeats[1:]):
+        bar = b - a
+        half.append(at(a + bar / 2))
+        thirds.append((at(a + bar / 3) + at(a + 2 * bar / 3)) / 2)
+    half, thirds = np.array(half), np.array(thirds)
+    level = float(np.percentile(body, 90))
+    # Clearly, and in most bars: a 3/4 band's off-beat after 2 doesn't hit like its beats.
+    if (level <= 0 or half.mean() < 0.3 * level or half.mean() < 1.5 * thirds.mean()
+            or np.mean(half > thirds) < 0.65):
+        return None
+    # Every eighth: the quarter beats and the points halfway between them, each on its attack.
+    beats = np.asarray(beats, float)
+    mids = (beats[:-1] + beats[1:]) / 2
+    curve = _attack_curve(y, sr)
+    mids, _ = _snap_to_attacks(mids, curve, sr, float(np.median(np.diff(beats))) / 2)
+    eighths = np.round(np.sort(np.concatenate([beats, mids])), 3)
+    if not np.all(np.diff(eighths) > 0):
+        return None
+    return eighths, eighths[int(np.argmin(np.abs(eighths - downbeats[0])))::6]
 
 
 def _periodicity(seg, lag: float) -> float:

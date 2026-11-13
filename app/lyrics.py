@@ -29,7 +29,7 @@ _KINDS = [
     (r"instrumental|inst|interlude|interlude musical|interludio", "inst"),
     (r"solo", "solo"),
     (r"break|pause", "break"),
-    (r"tag", "tag"),
+    (r"tag|hook", "tag"),
 ]
 _KIND_RE = [(re.compile(rf"^(?:{words})\.?\s*(\d+)?$", re.I), label) for words, label in _KINDS]
 _ACC = r"(?:#|b|♯|♭)?"

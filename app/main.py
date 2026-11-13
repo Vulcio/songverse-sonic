@@ -792,7 +792,7 @@ async def lifespan(_: FastAPI):
         task.cancel()
 
 
-app = FastAPI(title="Songverse Sonic", version="1.9.0", lifespan=lifespan)
+app = FastAPI(title="Songverse Sonic", version="1.10.0", lifespan=lifespan)
 
 
 class StageRequest(BaseModel):

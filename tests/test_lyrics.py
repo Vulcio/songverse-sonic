@@ -237,7 +237,7 @@ def test_lyrics_too_long_are_refused(main):
 
 def test_health_says_lyrics_are_read(main):
     assert main.health()["analysis"]["lyrics"] is True
-    assert main.health()["version"] == "1.9.0"
+    assert main.health()["version"] == "1.10.0"
 
 
 def test_hint_and_name_kept_only_when_valid():
@@ -250,3 +250,9 @@ def test_hint_and_name_kept_only_when_valid():
     ]})
     assert out["sections"] == [{"start": 0.0, "label": "verse", "hint": 0, "name": "Verse 1"},
                                {"start": 10.0, "label": "chorus"}, {"start": 20.0, "label": "inst"}]
+
+
+def test_hook_is_a_heading():
+    # As Musixmatch writes a song's parts (issue #24).
+    passes = lyrics.parse("verse\nOne line\nhook\nJe chante alléluia\nverse\nTwo line\nhook\nAlléluia\n")
+    assert [(p.name, p.kind) for p in passes] == [("verse", "verse"), ("hook", "tag"), ("verse", "verse"), ("hook", "tag")]

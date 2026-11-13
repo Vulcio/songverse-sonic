@@ -75,3 +75,26 @@ def test_free_intro_then_bar_one_within_10_ms(tmp_path, seed, bpm, free):
     out = analyze_rhythm(sum(ys.values()), ys["drums"] + ys["bass"], synth.SR, ys["drums"], ys["other"] + ys["bass"])
     assert out["intro_free"] is True
     assert abs(out["first_beat"] - first) <= 0.010
+
+
+@pytest.mark.parametrize("eighths,lead,seed,hats", [(138, 0.6, 5, True), (150, 1.2, 6, True), (120, 0.0, 7, True),
+                                                    (165, 0.4, 8, True), (142, 0.4, 9, False), (126, 1.0, 10, False)])
+def test_six_eight_counted_in_eighths(tmp_path, eighths, lead, seed, hats):
+    """A 6/8 song (kick on 1, snare on 4) heard as 3/4 has the right bar lines but the wrong
+    beats: it's counted in its six eighths, its tempo in eighths as API.md says (the beats'). Without
+    hi-hats, the kick and snare alone make a 4/4 half-time bar too: the keys' eighths tell."""
+    librosa = pytest.importorskip("librosa")
+    import synth
+    from rhythm import analyze_rhythm
+
+    first, e = synth.make_compound(tmp_path, eighths_bpm=eighths, lead=lead, seed=seed, hats=hats)
+    ys = {n: librosa.load(str(tmp_path / f"{n}.wav"), sr=synth.SR)[0] for n in ("drums", "bass", "other", "vocals")}
+    out = analyze_rhythm(sum(ys.values()), ys["drums"] + ys["bass"], synth.SR, ys["drums"], ys["other"] + ys["bass"])
+    assert (out["time_signature"]["numerator"], out["time_signature"]["denominator"]) == (6, 8)
+    assert abs(out["tempo"]["bpm"] - eighths) < 0.5
+    assert abs(out["first_beat"] - first) <= 0.010
+    beats = np.array(out["beats"])
+    n = np.round((beats - first) / e)
+    assert np.all(np.diff(n) == 1)
+    assert np.max(np.abs(beats - (first + n * e))) <= 0.010
+    assert np.all(np.round((np.array(out["downbeats"]) - first) / e) % 6 == 0)

@@ -162,3 +162,68 @@ def make_sections(dirpath, plan=(("A", 8), ("B", 8), ("A", 8), ("B", 8), ("C", 4
     for name, y in (("drums", drums), ("bass", bass), ("other", other), ("vocals", np.zeros(n))):
         sf.write(f"{dirpath}/{name}.wav", (y * 0.9).astype("float32"), SR)
     return starts, bar
+
+
+def make_click(path, beats, downbeats=(), duration=None, accent="pitch", jitter=0.0, seed=4):
+    """A click track like a multitrack's click stem: a short tone on every beat, the downbeats
+    accented by a higher pitch (`accent="pitch"`), by level ("level") or not at all (None).
+    `jitter` seconds of random delay per click stand for a click rendered off the grid."""
+    rng = np.random.default_rng(seed)
+    n = int(((duration or (max(beats) + 1.0))) * SR)
+    y = np.zeros(n)
+    k = np.arange(int(0.03 * SR)) / SR
+    down = {round(d, 6) for d in downbeats}
+    for b in beats:
+        strong = round(b, 6) in down
+        f = 1600.0 if strong and accent == "pitch" else 1000.0
+        level = 0.9 if strong and accent == "level" else 0.5
+        tone = np.sin(2 * np.pi * f * k) * np.exp(-k * 160) * level
+        s = int((b + (rng.uniform(0, jitter) if jitter else 0.0)) * SR)
+        if s < n:
+            e = min(n, s + len(tone))
+            y[s:e] += tone[: e - s]
+    sf.write(path, y.astype("float32"), SR)
+
+
+def make_compound(dirpath, eighths_bpm=138.0, bars=16, lead=0.6, seed=5, hats=True):
+    """A 6/8 song: kick on the first eighth, snare on the fourth (the second dotted quarter),
+    hi-hats on every eighth, a chord change each bar. Writes the four stems like make_song;
+    returns (first_downbeat_sec, eighth_sec). Without `hats`, the drums play only the kick and the
+    snare (a 4/4 half-time bar as much as a 6/8 one) and the keys play the eighths, an arpeggio."""
+    rng = np.random.default_rng(seed)
+    e = 60.0 / eighths_bpm
+    bar = 6 * e
+    n = int((lead + bars * bar + 1.0) * SR)
+    t = np.arange(n) / SR
+    drums, bass, other = np.zeros(n), np.zeros(n), np.zeros(n)
+    k = np.arange(int(0.15 * SR)) / SR
+    kick = np.sin(2 * np.pi * 55 * k) * np.exp(-k * 28)
+    snare = rng.standard_normal(len(k)) * np.exp(-k * 35) * 0.6
+    hat = np.diff(rng.standard_normal(len(k) + 2), 2) * np.exp(-k * 90) * 0.15
+
+    def hit(buf, at, sig):
+        s = int(at * SR)
+        if s < n:
+            buf[s:min(n, s + len(sig))] += sig[: min(n, s + len(sig)) - s]
+
+    chords = [(196.0, 246.94, 293.66), (164.81, 196.0, 246.94), (130.81, 164.81, 196.0), (146.83, 185.0, 220.0)]
+    for b in range(bars):
+        t0 = lead + b * bar
+        i0, i1 = int(t0 * SR), min(n, int((t0 + bar) * SR))
+        seg = t[i0:i1] - t0
+        f = chords[b % 4]
+        env = np.minimum(1, seg / 0.2) * 0.8
+        if hats:
+            other[i0:i1] += sum(np.sin(2 * np.pi * x * seg) for x in f) * 0.08 * env
+        else:
+            for j in range(6):
+                note = np.arange(int(e * SR)) / SR
+                hit(other, t0 + j * e, np.sin(2 * np.pi * 2 * f[j % 3] * note) * np.exp(-note * 9) * 0.25)
+        bass[i0:i1] += np.sin(2 * np.pi * (f[0] / 2) * seg) * 0.2 * env
+        hit(drums, t0, kick)
+        hit(drums, t0 + 3 * e, snare)
+        for j in range(6 if hats else 0):
+            hit(drums, t0 + j * e, hat)
+    for name, y in (("drums", drums), ("bass", bass), ("other", other), ("vocals", np.zeros(n))):
+        sf.write(f"{dirpath}/{name}.wav", (y * 0.9).astype("float32"), SR)
+    return lead, e
