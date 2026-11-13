@@ -88,6 +88,110 @@ def _time_list(value: Any, duration: float | None) -> list[float] | None:
     return out if all(b > a for a, b in zip(out, out[1:])) else None
 
 
+def _score(value: Any) -> float | None:
+    x = _num(value)
+    return round(x, 2) if x is not None and 0.0 <= x <= 1.0 else None
+
+
+def _alternatives(raw: Any, out: dict) -> dict:
+    """`alternatives` (issue #25): for each part the analysis has, up to 4 other values it nearly
+    picked, each valid as the part itself is and with a 0-1 `score`, the best first."""
+    if not isinstance(raw, dict):
+        return {}
+    clean: dict[str, list] = {}
+
+    def keep(part: str, items: Any, make) -> None:
+        if part not in out or not isinstance(items, list):
+            return
+        seen, values = set(), []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            score = _score(item.get("score"))
+            value = make(item) if score is not None else None
+            if value is None:
+                continue
+            ident = tuple(sorted(value.items()))
+            if ident in seen:
+                continue
+            seen.add(ident)
+            values.append({**value, "score": score})
+        values.sort(key=lambda v: -v["score"])
+        if values:
+            clean[part] = values[:4]
+
+    def tempo(item):
+        bpm = _num(item.get("bpm"))
+        return {"bpm": round(bpm, 1)} if bpm is not None and BPM_RANGE[0] <= bpm <= BPM_RANGE[1] \
+            and round(bpm, 1) != out["tempo"]["bpm"] else None
+
+    def meter(item):
+        n, d = item.get("numerator"), item.get("denominator")
+        ok = (isinstance(n, int) and not isinstance(n, bool) and 1 <= n <= 16 and isinstance(d, int)
+              and not isinstance(d, bool) and d in DENOMINATORS)
+        now = out["time_signature"]
+        return {"numerator": n, "denominator": d} if ok and (n, d) != (now["numerator"], now["denominator"]) else None
+
+    def first(item):
+        start = _num(item.get("start"))
+        return {"start": round(start, 3)} if start is not None and FIRST_BEAT_RANGE[0] <= start <= FIRST_BEAT_RANGE[1] \
+            and round(start, 3) != out["first_beat"] else None
+
+    def key(item):
+        name = item.get("name")
+        return {"name": name} if isinstance(name, str) and KEY_RE.match(name) and name != out["key"]["name"] else None
+
+    keep("tempo", raw.get("tempo"), tempo)
+    keep("time_signature", raw.get("time_signature"), meter)
+    keep("first_beat", raw.get("first_beat"), first)
+    keep("key", raw.get("key"), key)
+    return clean
+
+
+HINT_KEYS = {"bpm", "time_signature", "first_beat", "key"}
+
+
+def read_hints(raw: Any) -> dict:
+    """What the user says about a recording (issue #25): `{"rhythm": {...}, "key": "Gm"}` for the
+    analysis, from the API's `hints` object. Raises ValueError, with a message for the client, on
+    anything it can't take."""
+    if not isinstance(raw, dict):
+        raise ValueError("hints must be an object")
+    unknown = set(raw) - HINT_KEYS
+    if unknown:
+        raise ValueError(f"hints has unknown fields: {', '.join(sorted(unknown))}")
+    rhythm: dict[str, Any] = {}
+    out: dict[str, Any] = {}
+    if raw.get("bpm") is not None:
+        bpm = _num(raw["bpm"])
+        if bpm is None or not BPM_RANGE[0] <= bpm <= BPM_RANGE[1]:
+            raise ValueError(f"hints.bpm must be a number from {BPM_RANGE[0]} to {BPM_RANGE[1]}")
+        rhythm["bpm"] = float(bpm)
+    if raw.get("time_signature") is not None:
+        ts = raw["time_signature"]
+        if isinstance(ts, str) and re.fullmatch(r"\d{1,2}/\d{1,2}", ts.strip()):
+            n, d = (int(x) for x in ts.strip().split("/"))
+        elif isinstance(ts, dict):
+            n, d = ts.get("numerator"), ts.get("denominator")
+        else:
+            n = d = None
+        if not (isinstance(n, int) and not isinstance(n, bool) and 1 <= n <= 16 and d in DENOMINATORS):
+            raise ValueError('hints.time_signature must be like "6/8": 1 to 16 over 2, 4, 8 or 16')
+        rhythm["time_signature"] = (n, d)
+    if raw.get("first_beat") is not None:
+        first = _num(raw["first_beat"])
+        if first is None or not FIRST_BEAT_RANGE[0] <= first <= FIRST_BEAT_RANGE[1]:
+            raise ValueError(f"hints.first_beat must be seconds from {FIRST_BEAT_RANGE[0]} to {FIRST_BEAT_RANGE[1]}")
+        rhythm["first_beat"] = float(first)
+    if raw.get("key") is not None:
+        if not isinstance(raw["key"], str) or not KEY_RE.match(raw["key"]):
+            raise ValueError('hints.key must be a key like "G" or "Bbm"')
+        out["key"] = raw["key"]
+    if rhythm:
+        out["rhythm"] = rhythm
+    return out
+
+
 def sanitize_analysis(raw: Any, duration: float | None = None) -> dict | None:
     """Return a contract-conformant analysis dict, or None when nothing valid is left.
 
@@ -168,6 +272,10 @@ def sanitize_analysis(raw: Any, duration: float | None = None) -> dict | None:
         clean.sort(key=lambda s: s["start"])
         if clean:
             out["sections"] = clean
+
+    alternatives = _alternatives(raw.get("alternatives"), out)
+    if alternatives:
+        out["alternatives"] = alternatives
 
     engines = raw.get("engines")
     if out and isinstance(engines, dict):
@@ -278,7 +386,16 @@ def _key(y_harm, sr: int) -> dict:
     (r1, tonic, minor), (r2, _, _) = candidates[0], candidates[1]
     # Margin to the runner-up (often the relative major/minor) plus absolute fit.
     conf = 0.6 * min(1.0, (r1 - r2) / 0.08) + 0.4 * min(1.0, max(0.0, (r1 - 0.4) / 0.4))
-    return {"name": key_name(tonic, minor), "confidence": min(1.0, max(0.0, conf))}
+    # What was nearly picked (issue #25): the next keys, scored like the confidence against the one
+    # after them - the relative major or minor is usually first.
+    alternatives = []
+    for i, (r, t, m) in enumerate(candidates[1:4], start=1):
+        nxt = candidates[i + 1][0]
+        score = 0.6 * min(1.0, (r - nxt) / 0.08) + 0.4 * min(1.0, max(0.0, (r - 0.4) / 0.4))
+        score = round(min(1.0, max(0.0, min(score, conf))), 2)
+        if score >= 0.2:
+            alternatives.append({"name": key_name(t, m), "score": score})
+    return {"name": key_name(tonic, minor), "confidence": min(1.0, max(0.0, conf)), "_alternatives": alternatives}
 
 
 def _bar_novelty(F, downbeats, sr: int, hop: int):
@@ -525,7 +642,7 @@ def _sections(y_mix, y_vocals, sr: int, first_downbeat: float | None, bar_len: f
     return out
 
 
-def _analyze_librosa(files: list[Path], source: Path | None, budget: _Budget, passes=None) -> dict:
+def _analyze_librosa(files: list[Path], source: Path | None, budget: _Budget, passes=None, hints=None) -> dict:
     sr = 22050
     drums, bass = _find_stem(files, "drums"), _find_stem(files, "bass")
     other, vocals = _find_stem(files, "other"), _find_stem(files, "vocals")
@@ -551,10 +668,12 @@ def _analyze_librosa(files: list[Path], source: Path | None, budget: _Budget, pa
         y = _mix(rp, sr) if rp else full_mix()
         harm_parts = [p for p in (bass, other) if p] or ([no_vocals] if no_vocals else [])
         rhythm = analyze_rhythm(full_mix(), y, sr, _load(drums, sr) if drums else None,
-                                _mix(harm_parts, sr) if harm_parts else None)
+                                _mix(harm_parts, sr) if harm_parts else None, (hints or {}).get("rhythm"))
         for k in ("tempo", "time_signature", "first_beat", "beats", "downbeats", "beats_confidence", "intro_free"):
             if k in rhythm:
                 result[k] = rhythm[k]
+        if rhythm.get("_alternatives"):
+            result["alternatives"] = dict(rhythm["_alternatives"])
         result["_duration"] = len(full_mix()) / sr
     except Exception:
         log.exception("analysis: rhythm step failed")
@@ -563,9 +682,12 @@ def _analyze_librosa(files: list[Path], source: Path | None, budget: _Budget, pa
         try:
             parts = [p for p in (bass, other) if p] or ([no_vocals] if no_vocals else [])
             y = _mix(parts, sr) if parts else full_mix()
-            k = _key(y, sr)
+            k = {"name": hints["key"], "confidence": 1.0} if (hints or {}).get("key") else _key(y, sr)
+            alternatives = k.pop("_alternatives", None)
             if k:
                 result["key"] = k
+            if alternatives:
+                result.setdefault("alternatives", {})["key"] = alternatives
         except Exception:
             log.exception("analysis: key step failed")
     else:
@@ -731,12 +853,12 @@ def run_with_hard_limit(target, args: tuple, limit: float):
 
 
 def analyze_job_with_limit(files: list[Path], source: Path | None, work_dir: Path, device: str = "cpu",
-                           lyrics_text: str | None = None) -> dict | None:
+                           lyrics_text: str | None = None, hints: dict | None = None) -> dict | None:
     """analyze_job in its own process, stopped at ANALYSIS_HARD_LIMIT_SECONDS. Never raises."""
     if not ANALYSIS_ENABLED:
         return None
     try:
-        return run_with_hard_limit(analyze_job, (list(files), source, work_dir, device, lyrics_text),
+        return run_with_hard_limit(analyze_job, (list(files), source, work_dir, device, lyrics_text, hints),
                                    ANALYSIS_HARD_LIMIT)
     except Exception:
         log.exception("analysis: could not start its process")
@@ -744,9 +866,10 @@ def analyze_job_with_limit(files: list[Path], source: Path | None, work_dir: Pat
 
 
 def analyze_job(files: list[Path], source: Path | None, work_dir: Path, device: str = "cpu",
-                lyrics_text: str | None = None) -> dict | None:
+                lyrics_text: str | None = None, hints: dict | None = None) -> dict | None:
     """Analyse a job after its fast pass. Never raises; returns a sanitised dict or None.
-    `lyrics_text`: the client's lyrics (issue #22), to find its own sections."""
+    `lyrics_text`: the client's lyrics (issue #22), to find its own sections. `hints`: what the
+    user says (issue #25), as read by read_hints."""
     if not ANALYSIS_ENABLED:
         return None
     passes = None
@@ -766,11 +889,15 @@ def analyze_job(files: list[Path], source: Path | None, work_dir: Path, device: 
                 raw = _analyze_allin1(files, source, work_dir, device, budget)
             except Exception:
                 log.exception("analysis: allin1 backend failed; falling back to librosa")
-        fallback = _analyze_librosa(files, source, budget, passes)
+        hints = read_hints(hints) if hints else None
+        if hints and ANALYSIS_BACKEND == "allin1":
+            raw = {}                      # the user's values decide the beats: librosa's tracker takes them
+        fallback = _analyze_librosa(files, source, budget, passes, hints)
         duration = fallback.pop("_duration", None)
         # Keep All-In-One's values where it had them; fill the rest from librosa. Beats and the
         # fields derived from them travel together, so never mix the two trackers' versions.
-        beat_keys = {"tempo", "first_beat", "beats", "downbeats", "beats_confidence", "intro_free", "beat_chords"}
+        beat_keys = {"tempo", "first_beat", "beats", "downbeats", "beats_confidence", "intro_free", "beat_chords",
+                     "alternatives"}
         engines = fallback.pop("engines", {})
         if raw:
             primary = f"allin1@{SONIC_VERSION}"

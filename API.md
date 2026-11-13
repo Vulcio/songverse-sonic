@@ -1,6 +1,6 @@
 # Songverse Sonic API
 
-API version: **1.10.0**
+API version: **1.11.0**
 
 The service provides asynchronous Demucs stem separation with an optional two-stage workflow:
 
@@ -91,7 +91,7 @@ Example response:
 {
   "status": "ok",
   "service": "songverse-sonic",
-  "version": "1.10.0",
+  "version": "1.11.0",
   "queue_depth": 0,
   "queued_fast": 0,
   "scheduled_hq": 3,
@@ -106,7 +106,8 @@ Example response:
   },
   "analysis": {
     "enabled": true, "backend": "librosa", "chords": "btc",
-    "parts": ["rhythm", "key", "sections", "chords"], "analysis_only": true, "lyrics": true
+    "parts": ["rhythm", "key", "sections", "chords"], "analysis_only": true, "lyrics": true,
+    "alternatives": true, "hints": true
   }
 }
 ```
@@ -182,6 +183,7 @@ Multipart fields:
 | `callback_secret` | no | | HMAC signing secret |
 | `separate` | no | `true` | Since 1.8: `false` for an **analysis-only job** (see below) |
 | `lyrics` | no | | Since 1.9: the song's words, to find its own sections (see [Lyrics](#lyrics)) |
+| `hints` | no | | Since 1.11: what the user says about the recording, as JSON (see [Hints](#hints)) |
 
 Example: fast now and HQ tonight:
 
@@ -226,6 +228,24 @@ doesn't have (an intro, an instrumental): such a stretch is a section without `h
 passes don't fit the recording, the lyrics are not used and the sections are found as without them.
 `analysis.lyrics` in `/health` says whether the server reads them; an older server ignores the field.
 
+### Hints
+
+Since 1.11, a job can carry what the user says about the recording (`hints`: a JSON object, as a
+form field here, as an object in a URL job), usually on an [analysis-only job](#analysis-only-jobs) after the
+user picked one of the analysis's [alternatives](#music-analysis) or set a value by hand:
+
+| Field | Meaning |
+|---|---|
+| `time_signature` | `"6/8"`, or `{"numerator": 6, "denominator": 8}`: 1 to 16 over 2, 4, 8 or 16. The bar lines found without it are kept (6/8 and 3/4 share theirs, so do 4/4 and a half-time 2/4), counted in its beats; 12/8 joins two bars of 6/8. |
+| `bpm` | The beats' tempo, counting the time signature's own note (eighths in 6/8), 20 to 400. |
+| `first_beat` | Where bar 1 starts, in seconds: the beat nearest it becomes bar 1, the beats before it a pickup. |
+| `key` | Like `key.name` (`"G"`, `"Bbm"`). Used as it is. |
+
+Each one given is kept as it is, with confidence 1, and the rest is found around it: the beats,
+downbeats and sections follow the bar the user gave. A value the audio doesn't support is used anyway.
+Anything else is refused (400, the message names the field). `analysis.hints` in `/health` says
+whether the server reads them; an older server ignores the field.
+
 ## Submit a remote URL
 
 This is useful when MeTube or another internal service exposes the completed WAV over HTTP.
@@ -256,6 +276,7 @@ Example:
 
 `"separate": false` (top level, since 1.8) makes it an [analysis-only job](#analysis-only-jobs); `hq` is then left out.
 `"lyrics": "…"` (top level, since 1.9) carries the song's [lyrics](#lyrics).
+`"hints": {…}` (top level, since 1.11) carries what the user says about it ([hints](#hints)).
 
 If `hq.not_before` is omitted, the API schedules the HQ pass for the next configured HQ window. With the defaults, that is the next time the local `Europe/Paris` clock enters **02:00-07:00**.
 
@@ -393,7 +414,12 @@ Since v1.4 a job carries an optional, top-level `analysis` block (next to `fast`
     { "start": 7.06, "end": 10.38, "root": 0, "quality": "maj", "bass": 4, "label": "C/3" }
   ],
   "beat_chords": [1, 1, 1, 1, 2],
-  "engines": { "rhythm": "librosa@1.10.0", "key": "librosa@1.10.0", "sections": "librosa-lyrics@1.10.0", "chords": "btc@1673d23f8f9a" }
+  "alternatives": {
+    "tempo": [{ "bpm": 71.1, "score": 0.54 }],
+    "time_signature": [{ "numerator": 3, "denominator": 4, "score": 0.47 }],
+    "key": [{ "name": "Em", "score": 0.44 }]
+  },
+  "engines": { "rhythm": "librosa@1.11.0", "key": "librosa@1.11.0", "sections": "librosa-lyrics@1.11.0", "chords": "btc@1673d23f8f9a" }
 }
 ```
 
@@ -422,6 +448,7 @@ Since v1.4 a job carries an optional, top-level `analysis` block (next to `fast`
 | `sections` | In time order: `start` (seconds) and a lowercase `label`. Labels used: `intro`, `verse`, `pre-chorus`, `chorus`, `bridge`, `inst`, `instrumental`, `solo`, `break`, `interlude`, `outro`, `tag`. Since 1.9, when the job's [lyrics](#lyrics) were used: `hint`, the 0-based pass of the lyrics the section is (two sections share one when the recording sings it once more), and `name`, that pass's heading as written (left out when it had none); a section without `hint` is a stretch the lyrics don't have. |
 | `chords` | Since 1.7, only when the server has chords turned on (`analysis.chords` in `/health`). The recording's chords in time order, not overlapping, within the file: `start`, `end` (seconds), `label`. `"label": "N"` is a stretch with no chord (silence, drums alone) and has nothing else. Otherwise `root` and `bass` are pitch classes, 0 = C to 11 = B, so a client spells them in the song's key (`root: 1` is C# or Db); `bass` is left out when it is the root. `quality` is one of `maj`, `min`, `dim`, `aug`, `min6`, `maj6`, `min7`, `minmaj7`, `maj7`, `7`, `dim7`, `hdim7`, `sus2`, `sus4`. `label` is the chord in Harte's syntax (as `mir_eval` reads it), for display and comparison only: read `root`, `quality` and `bass`. All or nothing, like `beats`. |
 | `beat_chords` | Since 1.7, only with `beats` and `chords`: for each entry of `beats`, the index in `chords` of the chord sounding there (the one heard longest until the next beat), or `null`. Same length as `beats`. |
+| `alternatives` | Since 1.11: what the analysis nearly picked, for a client to offer the user (issue #25). Per part present (`tempo`, `time_signature`, `first_beat`, `key`), up to 4 other values shaped like the part (`bpm`; `numerator` and `denominator`; `start`; `name`), each with a `score` from 0 to 1, the best first. A score is on the scale of the part's confidence and below it; it is not a probability. Left out for a part with nothing close, and for a part the job's [hints](#hints) gave. In 6/8, `tempo` offers the quarter-note reading (half the eighths) and `time_signature` the 3/4 or 4/4 it was heard as. |
 | `engines` | Since 1.7: which engine found each part present (`rhythm` for tempo, meter, beats and the first beat; `key`; `sections`; `chords`), as `name@version` (a chord engine's version is the start of its checkpoint's sha256). Parts from different engines are never mixed within one part. `sections` is `librosa-lyrics@…` when they were placed from the job's lyrics (since 1.9). |
 | `*.confidence` | 0 to 1 when available; omitted otherwise. `chords` has none: treat them as suggestions. |
 

@@ -17,7 +17,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import urljoin, urlparse, urlunparse
 from zoneinfo import ZoneInfo
 
@@ -589,16 +589,39 @@ def save_lyrics(job_id: str, lyrics: str | None) -> None:
         (JOBS_DIR / job_id / "lyrics.txt").write_text(lyrics, encoding="utf-8")
 
 
+def parse_hints(hints: Any) -> dict | None:
+    """A job's `hints` (issue #25): an object, or its JSON in a form field. 400 when unreadable."""
+    if hints is None or hints == "":
+        return None
+    if isinstance(hints, str):
+        try:
+            hints = json.loads(hints)
+        except ValueError:
+            raise HTTPException(400, "hints must be a JSON object")
+    try:
+        analysis.read_hints(hints)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return hints or None
+
+
+def save_hints(job_id: str, hints: dict | None) -> None:
+    if hints:
+        (JOBS_DIR / job_id / "hints.json").write_text(json.dumps(hints), encoding="utf-8")
+
+
 def run_analysis(job_id: str) -> dict | None:
     """The job's analysis, in a child process stopped at ANALYSIS_HARD_LIMIT_SECONDS (issue #7)."""
     lyrics_path = JOBS_DIR / job_id / "lyrics.txt"
+    hints_path = JOBS_DIR / job_id / "hints.json"
     try:
         row = get_job(job_id)
         inputs = sorted((JOBS_DIR / job_id / "input").iterdir())
         lyrics = lyrics_path.read_text(encoding="utf-8") if lyrics_path.exists() else None
+        hints = json.loads(hints_path.read_text(encoding="utf-8")) if hints_path.exists() else None
         return analysis.analyze_job_with_limit(
             result_files(job_id, "fast"), inputs[0] if inputs else None,
-            JOBS_DIR / job_id, row["fast_device"], lyrics,
+            JOBS_DIR / job_id, row["fast_device"], lyrics, hints,
         )
     except Exception:
         analysis.log.exception("analysis failed for job %s", job_id)
@@ -792,7 +815,7 @@ async def lifespan(_: FastAPI):
         task.cancel()
 
 
-app = FastAPI(title="Songverse Sonic", version="1.10.0", lifespan=lifespan)
+app = FastAPI(title="Songverse Sonic", version="1.11.0", lifespan=lifespan)
 
 
 class StageRequest(BaseModel):
@@ -816,6 +839,7 @@ class UrlJob(BaseModel):
     callback_url: HttpUrl | None = None
     callback_secret: str | None = None
     lyrics: str | None = None
+    hints: dict | None = None
 
 
 class HqScheduleRequest(BaseModel):
@@ -836,6 +860,10 @@ def analysis_info() -> dict:
         "analysis_only": analysis.ANALYSIS_ENABLED,
         # Since 1.9 (issue #22): a job's `lyrics` are read, to find the client's own sections.
         "lyrics": analysis.ANALYSIS_ENABLED,
+        # Since 1.11 (issue #25): what was nearly picked comes with the analysis, and a job's `hints`
+        # (what the user says) are kept as given.
+        "alternatives": analysis.ANALYSIS_ENABLED,
+        "hints": analysis.ANALYSIS_ENABLED,
     }
 
 
@@ -899,16 +927,19 @@ async def upload_job(
     callback_secret: str | None = Form(None),
     separate: bool = Form(True),
     lyrics: str | None = Form(None),
+    hints: str | None = Form(None),
 ):
     if callback_url:
         validate_remote_url(callback_url, ALLOW_PRIVATE_CALLBACK_URLS, "callback")
     validate_lyrics(lyrics)
+    hint_values = parse_hints(hints)
     jid = create_job(
         file.filename or "upload", model, device, two_stems,
         hq_enabled, hq_model, hq_device, hq_not_before,
         callback_url, callback_secret, separate,
     )
     save_lyrics(jid, lyrics)
+    save_hints(jid, hint_values)
     dest = JOBS_DIR / jid / "input" / Path(file.filename or "input.bin").name
     try:
         await save_upload(file, dest)
@@ -929,6 +960,7 @@ async def url_job(payload: UrlJob):
     if callback:
         validate_remote_url(callback, ALLOW_PRIVATE_CALLBACK_URLS, "callback")
     validate_lyrics(payload.lyrics)
+    hint_values = parse_hints(payload.hints)
     hq = payload.hq
     name = Path(urlparse(source).path).name or "remote-audio"
     jid = create_job(
@@ -945,6 +977,7 @@ async def url_job(payload: UrlJob):
         payload.separate,
     )
     save_lyrics(jid, payload.lyrics)
+    save_hints(jid, hint_values)
     dest = JOBS_DIR / jid / "input" / Path(name).name
     try:
         await download_url(source, dest)

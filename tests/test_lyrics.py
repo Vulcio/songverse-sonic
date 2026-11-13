@@ -216,7 +216,7 @@ def test_a_job_s_lyrics_reach_its_analysis_and_go(main, monkeypatch):
     jid = r.json()["id"]
     seen = []
     monkeypatch.setattr(main.analysis, "analyze_job_with_limit",
-                        lambda files, source, work_dir, device, lyrics=None: seen.append(lyrics) or {"tempo": {"bpm": 90.0}})
+                        lambda files, source, work_dir, device, lyrics=None, hints=None: seen.append(lyrics) or {"tempo": {"bpm": 90.0}})
     monkeypatch.setattr(main, "enqueue_notification", lambda *a: None)
     main.process_stage(jid, "fast")
     assert seen == ["{c: Chorus}\nLa la"]
@@ -237,7 +237,7 @@ def test_lyrics_too_long_are_refused(main):
 
 def test_health_says_lyrics_are_read(main):
     assert main.health()["analysis"]["lyrics"] is True
-    assert main.health()["version"] == "1.10.0"
+    assert main.health()["version"] == "1.11.0"
 
 
 def test_hint_and_name_kept_only_when_valid():

@@ -17,7 +17,7 @@ def check_contract(a, duration=None):
         return
     assert set(a) <= {"tempo", "first_beat", "time_signature", "key", "sections",
                       "beats", "downbeats", "intro_free", "beats_confidence",
-                      "chords", "beat_chords", "engines"}
+                      "chords", "beat_chords", "engines", "alternatives"}
     for k in ("tempo", "time_signature", "key"):
         if k in a and "confidence" in a[k]:
             assert 0 <= a[k]["confidence"] <= 1

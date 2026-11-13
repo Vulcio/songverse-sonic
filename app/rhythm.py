@@ -99,6 +99,52 @@ def _pick_tempo(env, sr: int, hop: int) -> tuple[float, float] | None:
 
 
 
+def _tempo_comb(env, sr: int, hop: int):
+    """The harmonic comb _pick_tempo scores a tempo by (autocorrelation at 1-4 beats), as a
+    function of the BPM - down to bars of 6 s, two of them at least - or None for too short an
+    envelope."""
+    import librosa
+    import numpy as np
+
+    fps = sr / hop
+    max_lag = min(int(fps * 24.0) + 2, env.size // 2)
+    if max_lag < int(fps * 60.0 / TEMPO_RANGE[0] * 2):
+        return None
+    x = env - env.mean()
+    ac = librosa.autocorrelate(x, max_size=max_lag + 1)
+    if ac[0] <= 0:
+        return None
+    ac = ac / ac[0]
+    lags = np.arange(len(ac))
+
+    def comb(b: float) -> float:
+        lag = 60.0 / b * fps
+        vals = [float(np.interp(k * lag, lags, ac)) for k in (1, 2, 3, 4) if k * lag <= len(ac) - 1]
+        return max(0.0, float(np.mean(vals))) if len(vals) >= 2 else 0.0   # one lag proves no period
+
+    return comb
+
+
+def _beat_range(n: int, d: int) -> tuple[float, float]:
+    """The tempos a time signature's beats are played at: eighths of compound time (6/8) faster."""
+    compound = d == 8 and n % 3 == 0 and n > 3
+    return (90.0, 260.0) if compound else (60.0, 240.0) if d == 8 else (40.0, 200.0)
+
+
+def _tempo_for_meter(found: float, meter: tuple[int, int], comb) -> float:
+    """The tempo of the beats a time signature the user gave counts (issue #25), from the one found:
+    of its multiples (1/4 to 4), within the range its note is played at (eighths of compound time
+    faster than quarters), the one whose bars - `numerator` beats - repeat best: the bar is what a
+    recording's parts agree on most, whatever they count it in."""
+    n, d = meter
+    lo, hi = _beat_range(n, d)
+    ratios = (1 / 4, 1 / 3, 1 / 2, 2 / 3, 3 / 4, 1.0, 4 / 3, 3 / 2, 2.0, 3.0, 4.0)
+    candidates = [found * r for r in ratios if lo <= found * r <= hi]
+    if not candidates:
+        return min(max(found, lo), hi)
+    return max(candidates, key=lambda b: comb(b / max(n, 1)) + 0.25 * comb(b))
+
+
 ATTACK_HOP = 32          # samples: ~1.5 ms at 22050 Hz
 ATTACK_WINDOW = 256      # samples: ~12 ms
 ATTACK_SEARCH = 0.06     # s each side of a tracked beat, at most a fifth of a beat
@@ -282,8 +328,12 @@ def _music_span(y, sr: int) -> tuple[float, float]:
             float(librosa.frames_to_time(idx[-1] + 1, sr=sr, hop_length=512)))
 
 
-def analyze_rhythm(y_full, y_rhythm, sr: int, y_drums=None, y_harm=None) -> dict:
+def analyze_rhythm(y_full, y_rhythm, sr: int, y_drums=None, y_harm=None, hints: dict | None = None) -> dict:
     """Tempo, first downbeat and meter.
+
+    `hints` (issue #25), what the user says: `bpm` (counting the time signature's own note),
+    `time_signature` as (numerator, denominator), `first_beat` in seconds. Each is kept as given and
+    the rest is found around it. Without them, what was nearly picked is in `_alternatives`.
 
     Beats are tracked on the full mix plus the drums/bass, so a drumless intro still gets a
     beat grid; the downbeat phase comes from low-frequency accents (kick/bass), and the grid
@@ -291,6 +341,46 @@ def analyze_rhythm(y_full, y_rhythm, sr: int, y_drums=None, y_harm=None) -> dict
     """
     import librosa
     import numpy as np
+
+    if hints and hints.get("time_signature") and not hints.get("bpm"):
+        # A time signature without a tempo: the bar found without it is kept (6/8 and 3/4, or 4/4
+        # half time, share their bar lines), counted in the beats the user's time signature has.
+        plain = analyze_rhythm(y_full, y_rhythm, sr, y_drums, y_harm,
+                               {"first_beat": hints["first_beat"]} if hints.get("first_beat") is not None else None)
+        downbeats = np.asarray(plain.get("downbeats") or [], float)
+        n, d = hints["time_signature"]
+        lo, hi = _beat_range(n, d)
+        if len(downbeats) >= 4:
+            bar = float(np.median(np.diff(downbeats)))
+            for bars in (1, 2, 0.5, 3):
+                if not lo <= n * 60.0 / (bar * bars) <= hi:
+                    continue
+                if bars == 0.5:
+                    halves = (downbeats[:-1] + downbeats[1:]) / 2
+                    lines = np.sort(np.concatenate([downbeats, halves]))
+                else:
+                    lines = downbeats[:: int(bars)]
+                # Bars split in two can leave a whole bar of music before the first line: carry
+                # the grid back over it (not past where the music starts).
+                step = float(np.median(np.diff(lines)))
+                onset = _music_span(y_full, sr)[0]
+                while hints.get("first_beat") is None and lines[0] - step >= onset - 0.25 * step / n and lines[0] - step >= -0.05:
+                    lines = np.concatenate([[max(0.0, lines[0] - step)], lines])
+                counted = _subdivide(y_drums if y_drums is not None else y_rhythm, sr, lines, n)
+                if counted is None:
+                    break
+                beats, bar_lines = counted
+                out = {k: v for k, v in plain.items() if k in ("intro_free", "beats_confidence")}
+                out.update({
+                    "tempo": {"bpm": 60.0 / float(np.median(np.diff(beats))), "confidence": 1.0},
+                    "time_signature": {"numerator": n, "denominator": d, "confidence": 1.0},
+                    "first_beat": float(bar_lines[0]), "beats": [float(t) for t in beats],
+                    "downbeats": [float(t) for t in bar_lines], "_downbeat_period": bar * bars,
+                    "_alternatives": {k: v for k, v in (plain.get("_alternatives") or {}).items() if k == "first_beat"},
+                })
+                return out
+        return analyze_rhythm(y_full, y_rhythm, sr, y_drums, y_harm, {**hints, "bpm": None}) if not len(downbeats) \
+            else plain
 
     hop = 512
     env_full = _norm_env(librosa.onset.onset_strength(y=y_full, sr=sr, hop_length=hop))
@@ -311,7 +401,15 @@ def analyze_rhythm(y_full, y_rhythm, sr: int, y_drums=None, y_harm=None) -> dict
         if len(d_env) == n and np.percentile(d_env, 95) > 0 and (d_env > 0.5).mean() > 0.02:
             tempo_env = d_env  # drum accents are the cleanest counting cue when there are drums
 
+    hints = hints or {}
+    hint_meter = hints.get("time_signature")
+    hinted = bool(hints.get("bpm") or hint_meter)
+    comb = _tempo_comb(tempo_env, sr, hop)
     picked = _pick_tempo(tempo_env, sr, hop)
+    if hints.get("bpm"):
+        picked = (float(hints["bpm"]), 1.0)
+    elif hint_meter and picked is not None and comb is not None:
+        picked = (_tempo_for_meter(picked[0], hint_meter, comb), 1.0)
     if picked is None:
         return {}
     bpm, tempo_conf = picked
@@ -328,7 +426,7 @@ def analyze_rhythm(y_full, y_rhythm, sr: int, y_drums=None, y_harm=None) -> dict
     # (the 1 then lands on a 2). When the kick hits as hard halfway between the tracked beats as on
     # them, those midpoints are beats too: count twice as fast.
     kick = _kick_flux(y_drums if y_drums is not None else y_rhythm, sr, hop)
-    if bpm * 2 <= 200 and np.percentile(kick, 99) > 0:
+    if not hinted and bpm * 2 <= 200 and np.percentile(kick, 99) > 0:
         mids = ((beat_frames[:-1] + beat_frames[1:]) // 2)
         def peak(frames):
             return np.array([kick[max(0, i - 1): i + 2].max() for i in frames if i < len(kick)])
@@ -343,7 +441,7 @@ def analyze_rhythm(y_full, y_rhythm, sr: int, y_drums=None, y_harm=None) -> dict
     # Double time, the other way round: a 60 BPM ballad with eighth-note hi-hats counted at 120,
     # every other "beat" a hi-hat alone. When the kick and snare play only on one beat in two,
     # count half as fast, on theirs.
-    elif y_drums is not None and bpm / 2 >= TEMPO_RANGE[0]:
+    elif not hinted and y_drums is not None and bpm / 2 >= TEMPO_RANGE[0]:
         def unit(x):
             return x / x.max() if x.max() > 0 else x
         body = unit(_kick_flux(y_drums, sr, hop)) + unit(_kick_flux(y_drums, sr, hop, 150.0, 2000.0))   # kick + snare
@@ -408,16 +506,23 @@ def analyze_rhythm(y_full, y_rhythm, sr: int, y_drums=None, y_harm=None) -> dict
         strength = strength + 1.2 * novelty
 
     scores: dict[int, tuple[float, int]] = {}
-    for m in (3, 4):
+    phases: dict[int, list[float]] = {}
+    for m in sorted({3, 4} | ({hint_meter[0]} if hint_meter and hint_meter[0] > 1 else set())):
         phase_means = [float(strength[p::m].mean()) for p in range(m)]
         best = int(np.argmax(phase_means))
         others = [v for i, v in enumerate(phase_means) if i != best]
         scores[m] = (phase_means[best] - float(np.mean(others)), best)
-    # Prior toward 4/4: only call 3/4 when its accent pattern is clearly stronger.
-    meter = 3 if scores[3][0] > scores[4][0] * 1.35 + 0.1 else 4
-    contrast, phase = scores[meter]
+        phases[m] = phase_means
+    if hint_meter:
+        meter = hint_meter[0] if hint_meter[0] > 1 else 1
+        contrast, phase = scores.get(meter, (1.5, 0))
+    else:
+        # Prior toward 4/4: only call 3/4 when its accent pattern is clearly stronger.
+        meter = 3 if scores[3][0] > scores[4][0] * 1.35 + 0.1 else 4
+        contrast, phase = scores[meter]
     result["time_signature"] = {
-        "numerator": meter, "denominator": 4, "confidence": min(1.0, max(0.0, contrast / 1.5)),
+        "numerator": meter, "denominator": hint_meter[1] if hint_meter else 4,
+        "confidence": 1.0 if hint_meter else min(1.0, max(0.0, contrast / 1.5)),
     }
 
     duration = len(y_full) / sr
@@ -490,27 +595,34 @@ def analyze_rhythm(y_full, y_rhythm, sr: int, y_drums=None, y_harm=None) -> dict
     if len(beats) < 4:
         return result
     k0 = int(np.argmin(np.abs(beats - first)))
+    if hints.get("first_beat") is not None:
+        # Bar 1 where the user says: the beat nearest it, the beats before it a pickup.
+        k0 = int(np.argmin(np.abs(beats - float(hints["first_beat"]))))
+        beats = beats[k0:]
+        k0 = 0
     downbeats = beats[k0::meter]
 
     beats_r = np.round(beats, 3)
     downbeats_r = np.round(downbeats, 3)
     if np.any(np.diff(beats_r) <= 0):
         return result
-    if meter == 4:
+    found_as = meter
+    six_eight = 0.0           # how much the bar sounded like 6/8 (0-1), for the alternatives
+    if meter == 4 and not hinted:
         # 6/8 counted as 4/4 (with the drums' stem: a kick on 1 and a snare on 4 also make a 4/4
         # half-time bar): the same bar, but the band plays its sixths, not its quarters.
-        compound = _sixths_bar(y_drums if y_drums is not None else y_rhythm, y_harm, sr, beats_r, downbeats_r)
+        compound, six_eight = _sixths_bar(y_drums if y_drums is not None else y_rhythm, y_harm, sr, beats_r, downbeats_r)
         if compound is not None:
             beats_r, downbeats_r = compound
-            result["time_signature"] = {**result["time_signature"], "numerator": 6, "denominator": 8}
-    if meter == 3:
+            result["time_signature"] = {"numerator": 6, "denominator": 8, "confidence": 0.5 + 0.5 * six_eight}
+    if meter == 3 and not hinted:
         # 6/8 counted as 3/4: the same bar, but felt as two groups of three eighths. The kick and
         # snare then hit halfway through the bar (the second dotted quarter), and hardly on the
         # 2nd and 3rd quarters, where a 3/4 band plays. Count the eighths then.
-        compound = _compound_bar(y_drums if y_drums is not None else y_rhythm, sr, hop, beats_r, downbeats_r)
+        compound, six_eight = _compound_bar(y_drums if y_drums is not None else y_rhythm, sr, hop, beats_r, downbeats_r)
         if compound is not None:
             beats_r, downbeats_r = compound
-            result["time_signature"] = {**result["time_signature"], "numerator": 6, "denominator": 8}
+            result["time_signature"] = {"numerator": 6, "denominator": 8, "confidence": 0.5 + 0.5 * six_eight}
     result["tempo"]["bpm"] = 60.0 / float(np.median(np.diff(beats_r)))
     result["first_beat"] = float(downbeats_r[0])
     result["beats"] = [float(t) for t in beats_r]
@@ -520,7 +632,70 @@ def analyze_rhythm(y_full, y_rhythm, sr: int, y_drums=None, y_harm=None) -> dict
     on_onset = float(hit[first_idx:].mean()) if len(hit[first_idx:]) else 0.0
     result["beats_confidence"] = min(on_onset, tempo_conf)
     result["_downbeat_period"] = bar_est
+    result["_alternatives"] = _alternatives(result, hints, comb, scores, phases, found_as, phase, six_eight, beats_r)
     return result
+
+
+def _alternatives(result: dict, hints: dict, comb, scores, phases, found_as: int, phase: int, six_eight: float,
+                  beats) -> dict:
+    """What was nearly picked, per part, with a score on the scale of the part's confidence (issue
+    #25), so a client can offer it to the user. Left out for a part the user gave."""
+    import numpy as np
+
+    out: dict = {}
+
+    def clip(x: float) -> float:
+        return round(min(1.0, max(0.0, float(x))), 2)
+
+    # An alternative scores below what was picked: the pick's confidence, scaled by how well the
+    # alternative fits next to it.
+    bpm = result["tempo"]["bpm"]
+    conf = result["tempo"].get("confidence", 1.0)
+    ts = result.get("time_signature") or {}
+    simple = (ts.get("denominator"), ts.get("numerator")) != (8, 6)
+    if not hints.get("bpm") and not hints.get("time_signature") and comb is not None and comb(bpm) > 0:
+        tempo = []
+        for r in (0.5, 2.0) + ((2 / 3, 1.5) if simple else ()):
+            b = bpm * r
+            if TEMPO_RANGE[0] <= b <= TEMPO_RANGE[1]:
+                score = clip(0.9 * conf * min(1.0, comb(b) / comb(bpm)))
+                if score >= 0.2:
+                    tempo.append({"bpm": round(b, 1), "score": score})
+        if tempo:
+            out["tempo"] = sorted(tempo, key=lambda a: -a["score"])
+    if ts and not hints.get("time_signature"):
+        now = (ts["numerator"], ts["denominator"])
+        meters = []
+        for m in (3, 4):
+            if (m, 4) != now and m in scores:
+                score = scores[m][0] / 1.5
+                if now == (6, 8):
+                    score = min(score, 1.0 - ts["confidence"] + 0.2) if m == found_as else score * 0.5
+                meters.append({"numerator": m, "denominator": 4, "score": clip(min(score, 0.9 * ts["confidence"]))})
+        if now != (6, 8):
+            meters.append({"numerator": 6, "denominator": 8, "score": clip(min(0.5 * six_eight, 0.9 * ts["confidence"]))})
+        meters = [m for m in meters if m["score"] >= 0.2]
+        if meters:
+            out["time_signature"] = sorted(meters, key=lambda a: -a["score"])
+    if (not hints.get("first_beat") and ts and (ts["numerator"], ts["denominator"]) != (6, 8)
+            and found_as in phases and len(beats) > found_as):
+        means = phases[found_as]
+        first = result.get("first_beat")
+        k0 = int(np.argmin(np.abs(np.asarray(beats) - first))) if first is not None else 0
+        starts = []
+        for p, v in enumerate(means):
+            if p == phase:
+                continue
+            others = [x for i, x in enumerate(means) if i != p]
+            shift = (p - phase) % found_as
+            if k0 + shift < len(beats):
+                score = clip((v - float(np.mean(others))) / 1.5)
+                score = min(score, 0.9 * ts.get("confidence", 1.0))
+                if score >= 0.2:
+                    starts.append({"start": float(beats[k0 + shift]), "score": clip(score)})
+        if starts:
+            out["first_beat"] = sorted(starts, key=lambda a: -a["score"])
+    return out
 
 
 def _sixths_bar(y, y_harm, sr: int, beats, downbeats):
@@ -532,7 +707,7 @@ def _sixths_bar(y, y_harm, sr: int, beats, downbeats):
 
     downbeats = np.asarray(downbeats, float)
     if len(downbeats) < 8:
-        return None
+        return None, 0.0
     hop = 256
     envs = []
     for part in (y, y_harm):
@@ -541,7 +716,7 @@ def _sixths_bar(y, y_harm, sr: int, beats, downbeats):
             if env.max() > 0:
                 envs.append(env / float(np.percentile(env, 99) or env.max()))
     if not envs:
-        return None
+        return None, 0.0
     n = min(len(e) for e in envs)
     env = sum(e[:n] for e in envs)
 
@@ -555,25 +730,35 @@ def _sixths_bar(y, y_harm, sr: int, beats, downbeats):
         sixths.append(np.mean([at(a + bar * k / 6) for k in (1, 2, 4, 5)]))
         quarters.append(np.mean([at(a + bar * k / 4) for k in (1, 3)]))
     sixths, quarters = np.array(sixths), np.array(quarters)
+    strength = min(1.0, max(0.0, (sixths.mean() / max(quarters.mean(), 1e-9) - 1.0) / 1.5))
     if sixths.mean() < 1.5 * quarters.mean() or np.mean(sixths > quarters) < 0.65:
-        return None
-    return _eighths(y, sr, downbeats)
+        return None, strength
+    return _eighths(y, sr, downbeats), strength
 
 
 def _eighths(y, sr: int, downbeats):
     """Six eighths to each bar, each on its attack where it has one; the downbeats every sixth."""
+    return _subdivide(y, sr, downbeats, 6)
+
+
+def _subdivide(y, sr: int, downbeats, n: int):
+    """`n` beats to each bar, each on its attack where it has one, the bar lines kept where they
+    are: (beats, downbeats), or None."""
     import numpy as np
 
-    grid = [a + (b - a) * k / 6 for a, b in zip(downbeats[:-1], downbeats[1:]) for k in range(6)]
+    downbeats = np.asarray(downbeats, float)
+    if len(downbeats) < 2 or n < 1:
+        return None
+    grid = [a + (b - a) * k / n for a, b in zip(downbeats[:-1], downbeats[1:]) for k in range(n)]
     grid.append(downbeats[-1])
     grid = np.asarray(grid, float)
-    eighth = float(np.median(np.diff(grid)))
-    snapped, _ = _snap_to_attacks(grid, _attack_curve(y, sr), sr, eighth)
-    snapped[::6] = downbeats                      # bar lines stay where they were found
-    eighths = np.round(snapped, 3)
-    if not np.all(np.diff(eighths) > 0):
+    beat = float(np.median(np.diff(grid)))
+    snapped, _ = _snap_to_attacks(grid, _attack_curve(y, sr), sr, beat)
+    snapped[::n] = downbeats                      # bar lines stay where they were found
+    beats = np.round(snapped, 3)
+    if not np.all(np.diff(beats) > 0):
         return None
-    return eighths, eighths[::6]
+    return beats, beats[::n]
 
 
 def _compound_bar(y, sr: int, hop: int, beats, downbeats):
@@ -587,11 +772,11 @@ def _compound_bar(y, sr: int, hop: int, beats, downbeats):
     import numpy as np
 
     if len(downbeats) < 8:
-        return None
+        return None, 0.0
     beats, downbeats = np.asarray(beats, float), np.asarray(downbeats, float)
     body = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop, fmax=2000)
     if not len(body) or body.max() <= 0:
-        return None
+        return None, 0.0
 
     def at(t, env=body):
         i = int(round(t * sr / hop))
@@ -605,7 +790,7 @@ def _compound_bar(y, sr: int, hop: int, beats, downbeats):
             m = min(len(on), len(off))
             on, off = on[:m], off[:m]
             if len(on) >= 4 and on.mean() > 0.3 * float(np.percentile(kick, 99)) and np.mean(on > 2 * off) >= 0.75:
-                return beats, downbeats[phase::2]
+                return (beats, downbeats[phase::2]), float(np.mean(on > 2 * off))
 
     half, thirds = [], []
     for a, b in zip(downbeats[:-1], downbeats[1:]):
@@ -613,11 +798,12 @@ def _compound_bar(y, sr: int, hop: int, beats, downbeats):
         half.append(at(a + bar / 2))
         thirds.append((at(a + bar / 3) + at(a + 2 * bar / 3)) / 2)
     half, thirds = np.array(half), np.array(thirds)
+    strength = min(1.0, max(0.0, (half.mean() / max(thirds.mean(), 1e-9) - 1.0) / 1.5))
     level = float(np.percentile(body, 90))
     # Clearly, and in most bars: a 3/4 band's off-beat after 2 doesn't hit like its beats.
     if (level <= 0 or half.mean() < 0.3 * level or half.mean() < 1.5 * thirds.mean()
             or np.mean(half > thirds) < 0.65):
-        return None
+        return None, strength
     # Every eighth: the quarter beats and the points halfway between them, each on its attack.
     beats = np.asarray(beats, float)
     mids = (beats[:-1] + beats[1:]) / 2
@@ -625,8 +811,8 @@ def _compound_bar(y, sr: int, hop: int, beats, downbeats):
     mids, _ = _snap_to_attacks(mids, curve, sr, float(np.median(np.diff(beats))) / 2)
     eighths = np.round(np.sort(np.concatenate([beats, mids])), 3)
     if not np.all(np.diff(eighths) > 0):
-        return None
-    return eighths, eighths[int(np.argmin(np.abs(eighths - downbeats[0])))::6]
+        return None, strength
+    return (eighths, eighths[int(np.argmin(np.abs(eighths - downbeats[0])))::6]), strength
 
 
 def _periodicity(seg, lag: float) -> float:
