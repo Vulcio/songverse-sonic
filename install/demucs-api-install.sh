@@ -41,6 +41,7 @@ curl -fsSL "$BASE_URL/app/main.py" -o "$APP_DIR/main.py"
 curl -fsSL "$BASE_URL/app/analysis.py" -o "$APP_DIR/analysis.py"
 curl -fsSL "$BASE_URL/app/chords.py" -o "$APP_DIR/chords.py"
 curl -fsSL "$BASE_URL/app/rhythm.py" -o "$APP_DIR/rhythm.py"
+curl -fsSL "$BASE_URL/app/lyrics.py" -o "$APP_DIR/lyrics.py"
 curl -fsSL "$BASE_URL/app/requirements.txt" -o "$APP_DIR/requirements.txt"
 curl -fsSL "$BASE_URL/app/VERSION" -o "$APP_DIR/VERSION"
 

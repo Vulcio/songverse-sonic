@@ -43,6 +43,7 @@ update_inside_container() {
   curl -fsSL "$BASE_URL/app/analysis.py" -o /opt/demucs-api/analysis.py
   curl -fsSL "$BASE_URL/app/chords.py" -o /opt/demucs-api/chords.py
   curl -fsSL "$BASE_URL/app/rhythm.py" -o /opt/demucs-api/rhythm.py
+  curl -fsSL "$BASE_URL/app/lyrics.py" -o /opt/demucs-api/lyrics.py
   curl -fsSL "$BASE_URL/app/requirements.txt" -o /opt/demucs-api/requirements.txt
   curl -fsSL "$BASE_URL/app/VERSION" -o /opt/demucs-api/VERSION
 

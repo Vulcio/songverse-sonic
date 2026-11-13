@@ -578,18 +578,33 @@ def enqueue_notification(job_id: str, event: str) -> None:
         ))
 
 
+def validate_lyrics(lyrics: str | None) -> None:
+    if lyrics is not None and len(lyrics.encode("utf-8")) > analysis.MAX_LYRICS_BYTES:
+        raise HTTPException(400, f"lyrics must be at most {analysis.MAX_LYRICS_BYTES // 1024} KB")
+
+
+def save_lyrics(job_id: str, lyrics: str | None) -> None:
+    """Kept beside the job's input until its analysis has read them (issue #22), then removed."""
+    if lyrics and lyrics.strip():
+        (JOBS_DIR / job_id / "lyrics.txt").write_text(lyrics, encoding="utf-8")
+
+
 def run_analysis(job_id: str) -> dict | None:
     """The job's analysis, in a child process stopped at ANALYSIS_HARD_LIMIT_SECONDS (issue #7)."""
+    lyrics_path = JOBS_DIR / job_id / "lyrics.txt"
     try:
         row = get_job(job_id)
         inputs = sorted((JOBS_DIR / job_id / "input").iterdir())
+        lyrics = lyrics_path.read_text(encoding="utf-8") if lyrics_path.exists() else None
         return analysis.analyze_job_with_limit(
             result_files(job_id, "fast"), inputs[0] if inputs else None,
-            JOBS_DIR / job_id, row["fast_device"],
+            JOBS_DIR / job_id, row["fast_device"], lyrics,
         )
     except Exception:
         analysis.log.exception("analysis failed for job %s", job_id)
         return None
+    finally:
+        lyrics_path.unlink(missing_ok=True)
 
 
 def process_stage(job_id: str, quality: Literal["fast", "hq"]) -> None:
@@ -777,7 +792,7 @@ async def lifespan(_: FastAPI):
         task.cancel()
 
 
-app = FastAPI(title="Songverse Sonic", version="1.8.1", lifespan=lifespan)
+app = FastAPI(title="Songverse Sonic", version="1.9.0", lifespan=lifespan)
 
 
 class StageRequest(BaseModel):
@@ -800,6 +815,7 @@ class UrlJob(BaseModel):
     two_stems: str | None = None
     callback_url: HttpUrl | None = None
     callback_secret: str | None = None
+    lyrics: str | None = None
 
 
 class HqScheduleRequest(BaseModel):
@@ -818,6 +834,8 @@ def analysis_info() -> dict:
         "parts": ([] if not analysis.ANALYSIS_ENABLED else
                   ["rhythm", "key", "sections"] + (["chords"] if analysis.ANALYSIS_CHORDS != "off" else [])),
         "analysis_only": analysis.ANALYSIS_ENABLED,
+        # Since 1.9 (issue #22): a job's `lyrics` are read, to find the client's own sections.
+        "lyrics": analysis.ANALYSIS_ENABLED,
     }
 
 
@@ -880,14 +898,17 @@ async def upload_job(
     callback_url: str | None = Form(None),
     callback_secret: str | None = Form(None),
     separate: bool = Form(True),
+    lyrics: str | None = Form(None),
 ):
     if callback_url:
         validate_remote_url(callback_url, ALLOW_PRIVATE_CALLBACK_URLS, "callback")
+    validate_lyrics(lyrics)
     jid = create_job(
         file.filename or "upload", model, device, two_stems,
         hq_enabled, hq_model, hq_device, hq_not_before,
         callback_url, callback_secret, separate,
     )
+    save_lyrics(jid, lyrics)
     dest = JOBS_DIR / jid / "input" / Path(file.filename or "input.bin").name
     try:
         await save_upload(file, dest)
@@ -907,6 +928,7 @@ async def url_job(payload: UrlJob):
     callback = str(payload.callback_url) if payload.callback_url else None
     if callback:
         validate_remote_url(callback, ALLOW_PRIVATE_CALLBACK_URLS, "callback")
+    validate_lyrics(payload.lyrics)
     hq = payload.hq
     name = Path(urlparse(source).path).name or "remote-audio"
     jid = create_job(
@@ -922,6 +944,7 @@ async def url_job(payload: UrlJob):
         payload.callback_secret,
         payload.separate,
     )
+    save_lyrics(jid, payload.lyrics)
     dest = JOBS_DIR / jid / "input" / Path(name).name
     try:
         await download_url(source, dest)

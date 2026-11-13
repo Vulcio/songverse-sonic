@@ -32,6 +32,7 @@ ANALYSIS_HARD_LIMIT = float(os.getenv("ANALYSIS_HARD_LIMIT_SECONDS", str(max(120
 # Chords (issue #15): off by default; "btc" or "btc-chordmini" (see README "Licences").
 ANALYSIS_CHORDS = os.getenv("ANALYSIS_CHORDS", "off").lower()
 # What the chord engine listens to: the whole mix, or the mix without drums and vocals.
+MAX_LYRICS_BYTES = 64 * 1024   # a job's lyrics (issue #22)
 ANALYSIS_CHORDS_INPUT = os.getenv("ANALYSIS_CHORDS_INPUT", "mix").lower()
 
 BPM_RANGE = (20.0, 400.0)
@@ -155,7 +156,15 @@ def sanitize_analysis(raw: Any, duration: float | None = None) -> dict | None:
                 continue
             label = label.strip().lower()
             if label in SECTION_LABELS:
-                clean.append({"start": round(start, 3), "label": label})
+                section = {"start": round(start, 3), "label": label}
+                # Since 1.9 (issue #22): which pass of the client's lyrics it is, and its name there.
+                hint = s.get("hint")
+                if isinstance(hint, int) and not isinstance(hint, bool) and 0 <= hint < 1000:
+                    section["hint"] = hint
+                    name = s.get("name")
+                    if isinstance(name, str) and name.strip():
+                        section["name"] = name.strip()[:80]
+                clean.append(section)
         clean.sort(key=lambda s: s["start"])
         if clean:
             out["sections"] = clean
@@ -272,18 +281,13 @@ def _key(y_harm, sr: int) -> dict:
     return {"name": key_name(tonic, minor), "confidence": min(1.0, max(0.0, conf))}
 
 
-def _bar_boundaries(F, downbeats, sr: int, hop: int):
-    """Section starts at bar lines where the music changes most (seconds, the first one 0.0), or
-    None when there are too few bars to judge.
-
-    Each bar is summed up by its mean features. A bar line's novelty compares the 4 bars before
-    it with the 4 after (and 2 with 2, for short sections). Peaks at least 4 bars apart, clearly
-    above the song's usual change, are section starts. Between two bar lines that change about as
-    much, the one that keeps sections a multiple of 4 bars long wins: songs move in phrases.
-    """
+def _bar_novelty(F, downbeats, sr: int, hop: int):
+    """Each whole bar's mean features, how much the music changes at each bar line (the 4 bars
+    before against the 4 after, plus half of 2 against 2), and the level of a clear change (robust:
+    one huge change doesn't hide the rest). None with fewer than 16 bars or no change at all."""
     import numpy as np
 
-    frames = np.round(downbeats * sr / hop).astype(int)
+    frames = np.round(np.asarray(downbeats) * sr / hop).astype(int)
     step = int(np.median(np.diff(frames))) if len(frames) > 1 else 0
     frames = frames[frames + step <= F.shape[1]]          # whole bars only: not the silence at the end
     if len(frames) < 16:
@@ -304,7 +308,26 @@ def _bar_boundaries(F, downbeats, sr: int, hop: int):
     if nov.max() <= 0:
         return None
     usual = float(np.median(nov[1:]))
-    level = usual + 1.4826 * float(np.median(np.abs(nov[1:] - usual)))   # robust: one huge change doesn't hide the rest
+    level = usual + 1.4826 * float(np.median(np.abs(nov[1:] - usual)))
+    return bars, nov, max(level, 1e-9)
+
+
+def _bar_boundaries(F, downbeats, sr: int, hop: int):
+    """Section starts at bar lines where the music changes most (seconds, the first one 0.0), or
+    None when there are too few bars to judge.
+
+    Each bar is summed up by its mean features. A bar line's novelty compares the 4 bars before
+    it with the 4 after (and 2 with 2, for short sections). Peaks at least 4 bars apart, clearly
+    above the song's usual change, are section starts. Between two bar lines that change about as
+    much, the one that keeps sections a multiple of 4 bars long wins: songs move in phrases.
+    """
+    import numpy as np
+
+    found = _bar_novelty(F, downbeats, sr, hop)
+    if found is None:
+        return None
+    bars, nov, level = found
+    nb = len(bars)
     peaks = [k for k in range(1, nb)
              if nov[k] >= level and nov[k] == nov[max(1, k - 2):min(nb, k + 3)].max()]
     chosen = [0]
@@ -329,9 +352,54 @@ def _bar_boundaries(F, downbeats, sr: int, hop: int):
     return starts
 
 
+def _bar_chords(chords: list[dict] | None, downbeats, end: float) -> list[set] | None:
+    """For each bar, the chords (root, minor) heard over at least a quarter of it."""
+    if not chords:
+        return None
+    out = []
+    for k, start in enumerate(downbeats):
+        stop = downbeats[k + 1] if k + 1 < len(downbeats) else end
+        heard = set()
+        for c in chords:
+            if c.get("label") == "N" or "root" not in c:
+                continue
+            overlap = min(stop, c["end"]) - max(start, c["start"])
+            if overlap >= 0.25 * (stop - start):
+                heard.add((int(c["root"]), str(c.get("quality", "")).startswith(("min", "dim", "hdim"))))
+        out.append(heard)
+    return out
+
+
+def _sections_from_lyrics(passes, F, y_vocals, sr: int, hop: int, downbeats, chords) -> list[dict] | None:
+    """The client's sections placed on the bars (issue #22), or None when they don't fit."""
+    import librosa
+    import numpy as np
+
+    import lyrics
+
+    found = _bar_novelty(F, downbeats, sr, hop)
+    if found is None:
+        return None
+    bars, nov, level = found
+    nb = len(bars)
+    db = np.asarray(downbeats, dtype=float)
+    bar_len = float(np.median(np.diff(db)))
+    voice = None
+    if y_vocals is not None:
+        rms = librosa.feature.rms(y=y_vocals, hop_length=hop)[0]
+        frames = np.round(db[:nb] * sr / hop).astype(int)
+        ends = np.append(frames[1:], frames[-1] + int(round(bar_len * sr / hop)))
+        per_bar = np.array([rms[a:max(a + 1, b)].mean() if a < len(rms) else 0.0 for a, b in zip(frames, ends)])
+        if per_bar.max() > 1e-3:
+            voice = np.clip(per_bar / (0.4 * per_bar.max()), 0.0, 1.0)
+    return lyrics.align(passes, bars, nov / level, db[:nb], bar_len, voice,
+                        _bar_chords(chords, list(db[:nb]), float(db[nb - 1] + bar_len)))
+
+
 def _sections(y_mix, y_vocals, sr: int, first_downbeat: float | None, bar_len: float | None,
-              downbeats: list[float] | None = None) -> list[dict]:
-    """Heuristic structure: segment on beat-less chroma+MFCC, cluster, label by energy/repetition."""
+              downbeats: list[float] | None = None, passes=None, chords=None) -> list[dict]:
+    """Heuristic structure: segment on beat-less chroma+MFCC, cluster, label by energy/repetition.
+    With the client's `passes` (issue #22), its own sections placed on the bars when they fit."""
     import librosa
     import numpy as np
 
@@ -358,6 +426,15 @@ def _sections(y_mix, y_vocals, sr: int, first_downbeat: float | None, bar_len: f
     k = min(k, n // 4)
     if k < 2:
         return []
+    if passes and downbeats and len(downbeats) >= 16:
+        try:
+            placed = _sections_from_lyrics(passes, np.vstack([z(chroma), z(mfcc), z(rms[None, :])]), y_vocals,
+                                           sr, hop, downbeats, chords)
+            if placed:
+                return placed
+            log.info("analysis: the lyrics' sections don't fit the recording; finding them without")
+        except Exception:
+            log.exception("analysis: placing the lyrics' sections failed")
     bar_starts = None
     if downbeats and len(downbeats) >= 16:
         # Sections start on bar lines, so look for them there: how much the music changes from the
@@ -448,7 +525,7 @@ def _sections(y_mix, y_vocals, sr: int, first_downbeat: float | None, bar_len: f
     return out
 
 
-def _analyze_librosa(files: list[Path], source: Path | None, budget: _Budget) -> dict:
+def _analyze_librosa(files: list[Path], source: Path | None, budget: _Budget, passes=None) -> dict:
     sr = 22050
     drums, bass = _find_stem(files, "drums"), _find_stem(files, "bass")
     other, vocals = _find_stem(files, "other"), _find_stem(files, "vocals")
@@ -509,7 +586,7 @@ def _analyze_librosa(files: list[Path], source: Path | None, budget: _Budget) ->
         try:
             y_voc = _load(vocals, sr) if vocals else None
             secs = _sections(full_mix(), y_voc, sr, result.get("first_beat"), rhythm.get("_downbeat_period"),
-                             result.get("downbeats"))
+                             result.get("downbeats"), passes, result.get("chords"))
             if secs:
                 result["sections"] = secs
         except Exception:
@@ -517,6 +594,8 @@ def _analyze_librosa(files: list[Path], source: Path | None, budget: _Budget) ->
     else:
         log.warning("analysis: time budget exhausted before sections")
     result["engines"] = {part: f"librosa@{SONIC_VERSION}" for part in ("rhythm", "key", "sections")}
+    if any("hint" in s for s in result.get("sections", [])):
+        result["engines"]["sections"] = f"librosa-lyrics@{SONIC_VERSION}"
     if "chords" in result:
         result["engines"]["chords"] = _chord_engine_id()
     return result
@@ -651,21 +730,32 @@ def run_with_hard_limit(target, args: tuple, limit: float):
     return value
 
 
-def analyze_job_with_limit(files: list[Path], source: Path | None, work_dir: Path, device: str = "cpu") -> dict | None:
+def analyze_job_with_limit(files: list[Path], source: Path | None, work_dir: Path, device: str = "cpu",
+                           lyrics_text: str | None = None) -> dict | None:
     """analyze_job in its own process, stopped at ANALYSIS_HARD_LIMIT_SECONDS. Never raises."""
     if not ANALYSIS_ENABLED:
         return None
     try:
-        return run_with_hard_limit(analyze_job, (list(files), source, work_dir, device), ANALYSIS_HARD_LIMIT)
+        return run_with_hard_limit(analyze_job, (list(files), source, work_dir, device, lyrics_text),
+                                   ANALYSIS_HARD_LIMIT)
     except Exception:
         log.exception("analysis: could not start its process")
         return None
 
 
-def analyze_job(files: list[Path], source: Path | None, work_dir: Path, device: str = "cpu") -> dict | None:
-    """Analyse a job after its fast pass. Never raises; returns a sanitised dict or None."""
+def analyze_job(files: list[Path], source: Path | None, work_dir: Path, device: str = "cpu",
+                lyrics_text: str | None = None) -> dict | None:
+    """Analyse a job after its fast pass. Never raises; returns a sanitised dict or None.
+    `lyrics_text`: the client's lyrics (issue #22), to find its own sections."""
     if not ANALYSIS_ENABLED:
         return None
+    passes = None
+    if lyrics_text:
+        try:
+            import lyrics
+            passes = lyrics.parse(lyrics_text) or None
+        except Exception:
+            log.exception("analysis: the lyrics couldn't be read")
     budget = _Budget(ANALYSIS_TIMEOUT)
     started = time.monotonic()
     raw: dict[str, Any] = {}
@@ -676,7 +766,7 @@ def analyze_job(files: list[Path], source: Path | None, work_dir: Path, device: 
                 raw = _analyze_allin1(files, source, work_dir, device, budget)
             except Exception:
                 log.exception("analysis: allin1 backend failed; falling back to librosa")
-        fallback = _analyze_librosa(files, source, budget)
+        fallback = _analyze_librosa(files, source, budget, passes)
         duration = fallback.pop("_duration", None)
         # Keep All-In-One's values where it had them; fill the rest from librosa. Beats and the
         # fields derived from them travel together, so never mix the two trackers' versions.
@@ -689,6 +779,10 @@ def analyze_job(files: list[Path], source: Path | None, work_dir: Path, device: 
             for part in ("key", "sections"):
                 if part in raw:
                     engines[part] = primary
+            # The client's own sections, placed on the bars, win over All-In-One's guess.
+            if any("hint" in s for s in fallback.get("sections", [])):
+                raw.pop("sections", None)
+                engines["sections"] = f"librosa-lyrics@{SONIC_VERSION}"
         if "beats" in raw:
             fallback = {k: v for k, v in fallback.items() if k not in beat_keys}
         for k, v in fallback.items():

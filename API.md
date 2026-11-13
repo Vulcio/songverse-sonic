@@ -1,6 +1,6 @@
 # Songverse Sonic API
 
-API version: **1.8.1**
+API version: **1.9.0**
 
 The service provides asynchronous Demucs stem separation with an optional two-stage workflow:
 
@@ -91,7 +91,7 @@ Example response:
 {
   "status": "ok",
   "service": "songverse-sonic",
-  "version": "1.8.1",
+  "version": "1.9.0",
   "queue_depth": 0,
   "queued_fast": 0,
   "scheduled_hq": 3,
@@ -106,7 +106,7 @@ Example response:
   },
   "analysis": {
     "enabled": true, "backend": "librosa", "chords": "btc",
-    "parts": ["rhythm", "key", "sections", "chords"], "analysis_only": true
+    "parts": ["rhythm", "key", "sections", "chords"], "analysis_only": true, "lyrics": true
   }
 }
 ```
@@ -181,6 +181,7 @@ Multipart fields:
 | `callback_url` | no | | Webhook endpoint |
 | `callback_secret` | no | | HMAC signing secret |
 | `separate` | no | `true` | Since 1.8: `false` for an **analysis-only job** (see below) |
+| `lyrics` | no | | Since 1.9: the song's words, to find its own sections (see [Lyrics](#lyrics)) |
 
 Example: fast now and HQ tonight:
 
@@ -206,6 +207,24 @@ the separations already queued, before any HQ pass. Refused (400) when the serve
 turned off: `analysis.analysis_only` in `/health` says whether it takes them. The analysis uses the
 mix only, so it can differ a little from a separation's, which listens to the drums and bass apart.
 A job's `separate` field says which kind it is (`true` for every job before 1.8).
+
+### Lyrics
+
+Since 1.9, a job can carry the song's words (`lyrics`, a form field here, a top-level string in a
+URL job), as LRC, ChordPro or plain text: Sonic tells which from the text. They are written in the
+order they are sung, a repeated chorus written again (ChordPro's `{chorus}` recall counts as one).
+Each block is a **pass**: what follows a heading (`{c: Chorus}`, `{start_of_verse: Verse 1}`,
+`Verse 2`, `[Bridge]`, `Refrain :`) up to the next one or a blank line, or, in an LRC, the lines up to a
+blank line. A block may hold chords (`[G]` inline, or chord lines) and no words (an intro, a solo).
+At most 64 KB (400 otherwise); they are read by the job's analysis and deleted, never kept with the job.
+
+With them, the analysis places those passes on the recording's bars instead of guessing how many
+sections there are and what each one is: each section in `sections` then says which pass it is
+(`hint`) and the name its heading gave it (`name`), see [Music analysis](#music-analysis). The
+recording may sing a pass once more than the text does, leave one out, or play a stretch the text
+doesn't have (an intro, an instrumental): such a stretch is a section without `hint`. When the
+passes don't fit the recording, the lyrics are not used and the sections are found as without them.
+`analysis.lyrics` in `/health` says whether the server reads them; an older server ignores the field.
 
 ## Submit a remote URL
 
@@ -236,6 +255,7 @@ Example:
 ```
 
 `"separate": false` (top level, since 1.8) makes it an [analysis-only job](#analysis-only-jobs); `hq` is then left out.
+`"lyrics": "…"` (top level, since 1.9) carries the song's [lyrics](#lyrics).
 
 If `hq.not_before` is omitted, the API schedules the HQ pass for the next configured HQ window. With the defaults, that is the next time the local `Europe/Paris` clock enters **02:00-07:00**.
 
@@ -363,8 +383,8 @@ Since v1.4 a job carries an optional, top-level `analysis` block (next to `fast`
   "key": { "name": "G", "confidence": 0.7 },
   "sections": [
     { "start": 0.0, "label": "intro" },
-    { "start": 8.3, "label": "verse" },
-    { "start": 40.1, "label": "chorus" }
+    { "start": 8.3, "label": "verse", "hint": 0, "name": "Verse 1" },
+    { "start": 40.1, "label": "chorus", "hint": 1, "name": "Chorus" }
   ],
   "chords": [
     { "start": 0.0, "end": 0.42, "label": "N" },
@@ -373,7 +393,7 @@ Since v1.4 a job carries an optional, top-level `analysis` block (next to `fast`
     { "start": 7.06, "end": 10.38, "root": 0, "quality": "maj", "bass": 4, "label": "C/3" }
   ],
   "beat_chords": [1, 1, 1, 1, 2],
-  "engines": { "rhythm": "librosa@1.8.1", "key": "librosa@1.8.1", "sections": "librosa@1.8.1", "chords": "btc@1673d23f8f9a" }
+  "engines": { "rhythm": "librosa@1.9.0", "key": "librosa@1.9.0", "sections": "librosa-lyrics@1.9.0", "chords": "btc@1673d23f8f9a" }
 }
 ```
 
@@ -399,10 +419,10 @@ Since v1.4 a job carries an optional, top-level `analysis` block (next to `fast`
 | `beats_confidence` | 0 to 1, for `beats` and `downbeats` together (low when the beats land on few onsets or the tempo octave is in doubt). Only present with `beats`. |
 | `intro_free` | `true`: no steady beat before the first downbeat (a rubato, spoken or free opening), so `first_beat` is where the beat starts. `false`: the beat is steady before it (or there is no intro). Left out when unknown. |
 | `key.name` | Letter `A`-`G`, optional `#` or `b`, then `m` for minor: `G`, `Bb`, `F#m`, `Ebm`. |
-| `sections` | In time order: `start` (seconds) and a lowercase `label`. Labels used: `intro`, `verse`, `pre-chorus`, `chorus`, `bridge`, `inst`, `instrumental`, `solo`, `break`, `interlude`, `outro`, `tag`. |
+| `sections` | In time order: `start` (seconds) and a lowercase `label`. Labels used: `intro`, `verse`, `pre-chorus`, `chorus`, `bridge`, `inst`, `instrumental`, `solo`, `break`, `interlude`, `outro`, `tag`. Since 1.9, when the job's [lyrics](#lyrics) were used: `hint`, the 0-based pass of the lyrics the section is (two sections share one when the recording sings it once more), and `name`, that pass's heading as written (left out when it had none); a section without `hint` is a stretch the lyrics don't have. |
 | `chords` | Since 1.7, only when the server has chords turned on (`analysis.chords` in `/health`). The recording's chords in time order, not overlapping, within the file: `start`, `end` (seconds), `label`. `"label": "N"` is a stretch with no chord (silence, drums alone) and has nothing else. Otherwise `root` and `bass` are pitch classes, 0 = C to 11 = B, so a client spells them in the song's key (`root: 1` is C# or Db); `bass` is left out when it is the root. `quality` is one of `maj`, `min`, `dim`, `aug`, `min6`, `maj6`, `min7`, `minmaj7`, `maj7`, `7`, `dim7`, `hdim7`, `sus2`, `sus4`. `label` is the chord in Harte's syntax (as `mir_eval` reads it), for display and comparison only: read `root`, `quality` and `bass`. All or nothing, like `beats`. |
 | `beat_chords` | Since 1.7, only with `beats` and `chords`: for each entry of `beats`, the index in `chords` of the chord sounding there (the one heard longest until the next beat), or `null`. Same length as `beats`. |
-| `engines` | Since 1.7: which engine found each part present (`rhythm` for tempo, meter, beats and the first beat; `key`; `sections`; `chords`), as `name@version` (a chord engine's version is the start of its checkpoint's sha256). Parts from different engines are never mixed within one part. |
+| `engines` | Since 1.7: which engine found each part present (`rhythm` for tempo, meter, beats and the first beat; `key`; `sections`; `chords`), as `name@version` (a chord engine's version is the start of its checkpoint's sha256). Parts from different engines are never mixed within one part. `sections` is `librosa-lyrics@…` when they were placed from the job's lyrics (since 1.9). |
 | `*.confidence` | 0 to 1 when available; omitted otherwise. `chords` has none: treat them as suggestions. |
 
 Notes on quality: the default backend is heuristic. Tempo is chosen with a prior toward roughly
@@ -420,13 +440,22 @@ another beat of the bar than the downbeats found from the drums, `downbeats` and
 there (`beats` and `tempo` do not change). Section starts (after the first, at 0) are always one
 of the reported `downbeats`, which follow the music when its tempo moves, so a client can cue or loop
 a section on whole bars. Since 1.8.1 they are found at the bar lines where the music changes most,
-preferring sections a multiple of 4 bars long, and `allin1`'s are placed on its downbeats too. The chord engine knows the 14 qualities
+preferring sections a multiple of 4 bars long, and `allin1`'s are placed on its downbeats too.
+Since 1.9, with the job's [lyrics](#lyrics), each pass is placed where the music changes, where it
+sounds like the other passes of the same kind (verses alike, choruses alike), where a vocal stem has
+voice for a sung pass, on the bars whose chords are the pass's (when chords are on), with about the
+same bars per line all through the song, and, from an LRC, where its first line is sung (the LRC's
+clock may be offset or run up to 15 % fast or slow against the recording's: it is fitted first). They
+are used only when same-kind passes really do sound alike, so a chart that doesn't match the
+recording is left unused; one whose structure matches but whose names are swapped can't be told.
+The chord engine knows the 14 qualities
 above and no inversions yet (`bass` is reserved for engines that find them); it was trained on pop
 and rock recordings, and may call a sus or add9 voicing a plain triad.
 
 `GET /api/v1/health` and `GET /api/v1/models` report `analysis.enabled`, `analysis.backend`, (since 1.7)
 `analysis.chords`: the chord engine, or `null` when chords are off, and (since 1.8) `analysis.parts`, the
-parts it can find (`rhythm`, `key`, `sections`, `chords`), and `analysis.analysis_only`.
+parts it can find (`rhythm`, `key`, `sections`, `chords`), and `analysis.analysis_only`; since 1.9
+`analysis.lyrics`, whether a job's lyrics are read.
 
 **Time limits.** `ANALYSIS_TIMEOUT_SECONDS` is a budget the analysis checks between its steps (later
 steps are skipped once it is spent). Since 1.8 the analysis also runs in a process of its own, stopped at

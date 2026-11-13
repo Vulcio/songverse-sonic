@@ -50,7 +50,7 @@ def test_analysis_only_job_skips_demucs(main, monkeypatch, tmp_path):
     monkeypatch.setattr(main, "run_demucs", lambda *a: pytest.fail("analysis only: no Demucs"))
     monkeypatch.setattr(main, "upload_r2", lambda *a: pytest.fail("analysis only: nothing to upload"))
     monkeypatch.setattr(main.analysis, "analyze_job_with_limit",
-                        lambda files, source, work_dir, device: found if source.name == "song.wav" and files == [] else None)
+                        lambda files, source, work_dir, device, lyrics=None: found if source.name == "song.wav" and files == [] else None)
     monkeypatch.setattr(main, "enqueue_notification", lambda job_id, event: events.append(event))
     main.process_stage(jid, "fast")
     job = main.public_job(main.get_job(jid))
