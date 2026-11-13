@@ -26,7 +26,8 @@ jobs:
       - run: python -m pytest tests
       # The built-in synthetic benchmark (issue #9): a smoke test of the harness, not a measure of real music.
       - run: python benchmarks/run.py --synthetic --chords btc --chords-input mix
-      - run: bash -n ct/demucs-api.sh install/demucs-api-install.sh docker/entrypoint.sh
+      # One bash -n per script: given several paths, bash parses only the first (issue #12).
+      - run: for f in ct/*.sh install/*.sh docker/*.sh; do bash -n "$f" || exit 1; done
 
   image:
     needs: test

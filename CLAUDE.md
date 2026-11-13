@@ -29,7 +29,7 @@ both the installer and the `Dockerfile`.
 pip install pytest librosa soundfile fastapi httpx boto3 python-multipart mir_eval
 pip install --index-url https://download.pytorch.org/whl/cpu torch   # the chord tests skip without it
 python -m pytest tests
-bash -n ct/demucs-api.sh install/demucs-api-install.sh docker/entrypoint.sh
+for f in ct/*.sh install/*.sh docker/*.sh; do bash -n "$f" || exit 1; done   # one script at a time
 docker build -t songverse-sonic:test .   # when the Dockerfile, docker/ or requirements change
 ```
 
